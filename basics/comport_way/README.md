@@ -59,6 +59,7 @@
 | Файл | Что внутри | Что брать |
 | --- | --- | --- |
 | `makcu_transport.h` | `RawComTransport`: свой overlapped-handle COM, кольцо 32 записей, открытие с пробой скорости 4М/1М/115200 и `DEVICE 0x02`, поток чтения, `kmQuery`/`transact`, **`Format::RawMove`** (0x69/0x6A: `prepareRaw`, `moveRaw`, квитанции, окно, перенос, `finish`) | `RawComTransport` в режиме `Format::RawMove`. Форматы `Mak`/`KmMove`/`KmMoveNow*` и `SdkTransport` - только для сравнения |
+| `mover_transport.h` | интерфейс `Transport` + `TransportStats` без SDK (общий с `../udp_way`, вынесен из `makcu_transport.h` 2026-10-10) | целиком |
 | `motion_engine.h` | `runMotion()`: абсолютная сетка QPC, тик 1 мс, догон пропущенных тиков, пауза при фризе ОС > 25 мс, шаг рендерера на каждую мс, перенос при занятом транспорте, `tx.finish()` в конце. `Trajectory`/`Pattern`/`makeFlicks` - тестовые фигуры | `runMotion` как образец цикла. Фигуры заменит внешний источник |
 | `abc_renderer.h` | `AbcRenderer`: загрузка модели (44 484 байта, CRC), профиль из ровно 256 настоящих 1-мс отчётов, `beginEvent(seed)` на прогон, `step()` раз в 1 мс, переворот оси Y (рендерер - Y вверх, HID - Y вниз) | целиком |
 | `substepper.h` | `Accumulator`: субстеппер с накопителем без шума - гладкое намерение за 1 мс -> целый отчёт, остаток копится (<= 0.5 отсчёта), путь точный. Частоту задаёт только скорость | целиком (альтернатива рендереру) |
