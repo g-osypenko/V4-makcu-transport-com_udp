@@ -1,8 +1,12 @@
 # Request: Raw movement at 1 kHz over the UDP (Ethernet) API
 
-**Firmware:** V4.094 (test). **Mouse:** Logitech Lightspeed receiver 046D:C547 at 1000 Hz on USB3,
-through a USB hub that also carries an RTL8152 USB-Ethernet adapter. **Transport:** UDP port 8080,
-RAW wrapper (`0x55` + 8-byte transaction + MAK_API frame), no encryption.
+**Firmware:** V4.094 (test). **Mouse:** Logitech Lightspeed receiver 046D:C547 at 1000 Hz on USB3.
+**Topology:** PC → switch → USB hub with an RTL8152 USB-Ethernet adapter, with the mouse receiver
+on the same hub → MAKCU USB3. **Transport:** UDP port 8080, RAW wrapper (`0x55` + 8-byte
+transaction + MAK_API frame), no encryption.
+
+**Network only.** In our setup the COM port (USB2) must stay disconnected, so we need 1 kHz
+over Ethernet.
 
 ## Goal
 
@@ -37,9 +41,21 @@ We send Raw movement (`0x69 RAW_MOVE` + `0x6A RAW_STATUS consume=1`) at 1000 com
    freed by its own `0x6A consume=1` (16 records). With at most ~581 frames/s, the ceiling is
    ~290 reports/s. Our best client keeps exactly one datagram in flight and sends the next one
    when the reply arrives. It gets 282–283 reports/s with an exact path and zero rejects.
-5. **`0x18 MOVE` over UDP loses most of the path.** At 500 commands/s with interpolation 0, the
-   HID rate is 554 Hz but only 28 % of the path arrives. At 1000 commands/s: 415 Hz, 14 %. Over
-   COM, `0x18` at 500 commands/s keeps the path exact.
+5. **`0x18 MOVE` over UDP drops part of the path.** Interpolation 0, constant speed of
+   2 counts/ms to the right, 3 s per command rate:
+
+   | commands/s | HID reports/s | reports per command | path received / sent |
+   | --- | --- | --- | --- |
+   | 125 | 500 | 4.00 | **1.00** |
+   | 200 | 556 | 2.78 | 0.70 |
+   | 222 | 556 | 2.50 | 0.63 |
+   | 238 | 556 | 2.34 | 0.59 |
+   | 250 | 556 | 2.22 | 0.55 |
+
+   The received fraction equals 556 / (4 × commands/s) in every row. It looks as if the
+   interpolator plans 4 reports per command, emits at most ~556 reports/s when fed over UDP, and
+   **drops** the planned steps that get no report instead of carrying them into later reports.
+   Over COM, `0x18` at 250–1000 commands/s keeps the path exact (at ~640 HID reports/s).
 6. **The UDP transport already accepts many records per datagram — it is not the bottleneck.**
    The performance test (`0x3F`) takes a batch of records in one datagram (`0x3F 06 <count> <id×count>`,
    count up to 62). Sending 62-record batches at the datagram limit, the board accepted
@@ -47,8 +63,23 @@ We send Raw movement (`0x69 RAW_MOVE` + `0x6A RAW_STATUS consume=1`) at 1000 com
    ceiling. So the ~1.72 ms per-frame cost is per *reply-bearing single* frame, not a transport
    limit. Movement (`0x69`) is the only thing still capped at one record per datagram: it rejects
    any payload other than exactly 10 bytes (`state 255 / reason 1`).
+7. **There is no cumulative receipt.** With 4 terminal records on the board we tried:
 
-## Requests (any of A–C would unblock 1 kHz over UDP)
+   | `0x6A` payload | reply | records freed |
+   | --- | --- | --- |
+   | `consume = 2` on the newest id | `255 / 1` | 0 |
+   | `consume = 255` on the newest id | `255 / 1` | 0 |
+   | `id = 0, consume = 1` | `255 / 1` | 0 |
+   | `id = 0xFFFFFFFF, consume = 1` | `255 / 5` | 0 |
+   | two `(id, consume=1)` pairs, 10 bytes | `255 / 1` | 0 |
+
+   Each normal `consume = 1` freed exactly one record. So every Raw report costs two UDP frames.
+8. **TCP (and therefore WebSocket `/ws`) is not reachable over the USB-Ethernet interface.**
+   Ping and UDP 8080 answer, but TCP 80, TCP 8080 and 30 other common TCP ports time out: no
+   SYN-ACK and no RST. The Toolkit's transport test connects to `ws://<host>/ws`, and MAK_API.md
+   lists WebSocket as a transport, so we would like to try it.
+
+## Requests (A, C or E would unblock 1 kHz over Ethernet)
 
 - **A. Let `0x69` (and `0x6A`) batch, the way `0x3F` already does.** Your UDP transport already
   accepts up to 62 records in one datagram for the performance test (`0x3F 06 <count> ...`), at
@@ -64,13 +95,21 @@ We send Raw movement (`0x69 RAW_MOVE` + `0x6A RAW_STATUS consume=1`) at 1000 com
   - remove the fixed ~1 ms after the reply.
 - **D. (Optional) A multi-record Raw move.** One frame with N `(id, x, y)` records, each going
   out in its own HID report, the same as N × `0x69`.
+- **E. Make WebSocket `/ws` reachable on the USB-Ethernet interface**, if it can carry `0x69` and
+  `0x6A` faster than ~580 commands/s (for example, several messages per TCP segment).
+- **F. (Bug) Keep the `0x18` path over UDP.** Carry undelivered interpolation steps into later
+  reports, as COM already does, instead of dropping them (measurement 5).
 
 ## Questions
 
 1. Is ~1.72 ms per UDP frame expected on MAKCU? Is there a setting or a test build that changes it?
 2. Does the encrypted UDP path (`0x03` record) have the same per-frame limit? Can its plaintext
-   carry more than one command?
+   carry more than one command? We have not tried it, because the AES key can be set only once.
 3. Is UDP batching (like BLE `MBAT` on MAKXD) planned for MAKCU?
+4. How do we reach the WebUI and WebSocket `/ws` on MAKCU over USB-Ethernet? The MAKXD setting
+   "WebUI access over network" and the Geek button do not exist on MAKCU. Does `/ws` accept
+   `0x69` faster than UDP, or does it go through the same per-command path?
+5. Is the `0x18` path loss over UDP (measurement 5) known? Does V4.086 change it?
 
-We can run test builds and report the same measurements: HID rate, interval histogram, path sent
-vs received, and Raw counters.
+We can run test builds over Ethernet and report the same measurements: HID rate, interval
+histogram, path sent vs received, and Raw counters.
