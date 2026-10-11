@@ -8,19 +8,29 @@
 //    команд в 0x6B - датаграмма отбрасывается целиком (или ERR).
 //  - Плата принимает ~583 датаграммы/с (одна на ~1.72 мс) на любой опкод, лишние
 //    теряются ДО обработки: потерянный 0x69 не исполнен (проверено опросом id).
-//    Сеть и ПК ни при чём: ICMP-эхо 2000/с без потерь.
+//    Сеть и ПК ни при чём: счётчик RX сетевого интерфейса платы растёт на каждую
+//    отправленную датаграмму (probes/udp_netstat.py).
+//  - Модель приёма (probes/udp_slot.py, udp_cycle_hist.py): корректный кадр занимает
+//    обработчик ~1.72 мс; датаграмма, пришедшая в первые ~0.65 мс после принятой,
+//    выбрасывается; одна, пришедшая позже, ждёт и обслуживается сразу по окончании
+//    цикла; ответ приходит на ПК через ~1.05 мс после отправки.
 //
-// Поэтому транспорт сам держит темп датаграмм: ведро токенов, в среднем одна
-// датаграмма на gapUs (1800 мкс), ёмкость burst (1). На сетке тиков 1 мс это
-// ровно 2 мс = 500 датаграмм/с без потерь. burst 2 разрешает редкие интервалы
-// 1 мс (~556/с, +11%), но плата теряет ~2% датаграмм (их транспорт восстанавливает).
-// move() == false, пока темп не позволяет: дельта остаётся у вызывающего и
-// уходит следующим тиком, путь не теряется.
+// Поэтому транспорт сам держит темп датаграмм, два режима:
+//   Pace::Reply (по умолчанию для RawMove): в полёте ровно одна датаграмма, следующая
+//     уходит сразу по ответу на предыдущую (из потока приёма, между тиками) или через
+//     kReplyWaitUs без ответа. Ответ приходит после окна выброса, но до конца цикла:
+//     новая датаграмма ждёт в "слоте" платы, плата работает без простоя, ~580/с без
+//     потерь. move() всегда принимает дельту в перенос транспорта, путь не теряется.
+//   Pace::Bucket (и для 0x18/0x67, у которых нет ответа): ведро токенов, в среднем одна
+//     датаграмма на gapUs (1800 мкс), ёмкость burst (1). На сетке тиков 1 мс это
+//     2 мс = 500 датаграмм/с без потерь. move() == false, пока темп не позволяет:
+//     дельта остаётся у вызывающего и уходит следующим тиком.
 //
 // Форматы:
-//   RawMove - 0x69 RAW_MOVE + квитанции 0x6A: каждый принятый move() = ровно
+//   RawMove - 0x69 RAW_MOVE + квитанции 0x6A: каждый отправленный 0x69 = ровно
 //             один HID-отчёт, мимо интерполятора. Каждая квитанция - отдельная
-//             датаграмма, поэтому потолок ~250 движений/с.
+//             датаграмма (контракт: consume=1 освобождает одну запись), поэтому
+//             потолок ~290 движений/с (Reply) или 250 (Bucket).
 //   Mak     - MOVE 0x18 (без ответа): через интерполятор прошивки.
 //   MoveNow - MOVE_NOW 0x67 (без ответа): на 4094 тоже через интерполятор.
 //
@@ -67,9 +77,13 @@ class RawUdpTransport final : public Transport {
 public:
     enum class Wire { Raw, Host };  // 0x55+nonce / голый кадр
     enum class Format { RawMove, Mak, MoveNow };
+    enum class Pace { Reply, Bucket };  // темп датаграмм: по ответам / ведро токенов
 
     static constexpr double kDefaultGapUs = 1800.0;
     static constexpr double kDefaultBurst = 1.0;
+    // Pace::Reply: без ответа столько - следующая датаграмма всё равно (потерю разберёт
+    // восстановление Raw). Обычно ответ приходит через 1.05-2.1 мс.
+    static constexpr double kReplyWaitUs = 3000.0;
 
     // Счётчики сети (все датаграммы, включая квитанции и служебные запросы).
     struct NetSnapshot {
@@ -78,7 +92,9 @@ public:
         uint64_t replies = 0;        // ответов, сопоставленных по nonce
         uint64_t unmatched = 0;      // ответов с чужим/повторным nonce, события
         uint64_t junk = 0;           // не разобранных датаграмм
-        uint64_t pacerWaits = 0;     // move() == false из-за темпа датаграмм
+        uint64_t pacerWaits = 0;     // дельта ждала темпа (Bucket: move() == false; Reply: ждёт в переносе)
+        uint64_t rxSends = 0;        // Reply: датаграмм, отправленных потоком приёма сразу по ответу
+        uint64_t replyTimeouts = 0;  // Reply: следующая датаграмма ушла по тайм-ауту ответа
         uint64_t sendBusy = 0;       // WSAEWOULDBLOCK
         double rttP50Ms = 0.0, rttP99Ms = 0.0, rttMaxMs = 0.0;
         double spanS = 0.0;          // от первой до последней отправки
@@ -174,6 +190,10 @@ public:
 
     void setFormat(Format f) { format_ = f; }
     [[nodiscard]] Format format() const { return format_; }
+    // Reply действует только для RawMove (у 0x18/0x67 нет ответа - для них ведро).
+    void setPace(Pace p) { pace_ = p; }
+    [[nodiscard]] Pace pace() const { return pace_; }
+    [[nodiscard]] bool replyPaced() const { return pace_.load() == Pace::Reply && format_.load() == Format::RawMove; }
     // Средний интервал между датаграммами (ведро токенов ёмкостью burst_). С burst_ = 1
     // на сетке тиков 1 мс фактический интервал - 2 мс (500 датаграмм/с).
     void setGapUs(double us) {
@@ -191,7 +211,7 @@ public:
     [[nodiscard]] double burst() const { return burst_; }
 
     [[nodiscard]] const char* name() const override {
-        switch (format_) {
+        switch (format_.load()) {
         case Format::RawMove: return "udp-raw69";
         case Format::Mak: return "udp-0x18";
         case Format::MoveNow: return "udp-0x67";
@@ -206,7 +226,9 @@ public:
     // ---- горячий путь ---------------------------------------------------------
     [[nodiscard]] bool move(int16_t dx, int16_t dy) override {
         if (!healthy()) return false;
-        if (format_ == Format::RawMove) return moveRaw(dx, dy, dx == 0 && dy == 0);
+        if (format_ == Format::RawMove) {
+            return pace_ == Pace::Reply ? moveRawReply(dx, dy) : moveRaw(dx, dy, dx == 0 && dy == 0);
+        }
         if (dx == 0 && dy == 0) return true;
         std::lock_guard<std::mutex> lock(sendMutex_);
         const int64_t now = Clock::now();
@@ -256,7 +278,7 @@ public:
         for (int attempt = 0; attempt < tries; ++attempt) {
             {
                 std::lock_guard<std::mutex> lock(sendMutex_);
-                waitPacerLocked();
+                waitPaceLocked();
                 std::lock_guard<std::mutex> sl(syncMutex_);
                 syncDone_ = false;
                 syncOp_ = op;
@@ -366,7 +388,7 @@ public:
         const uint8_t zero[5] = {0, 0, 0, 0, 0};
         {
             std::lock_guard<std::mutex> lock(sendMutex_);
-            waitPacerLocked();
+            waitPaceLocked();
             const int64_t t0 = Clock::now();
             const double step = static_cast<double>(Clock::fromUs(gapUs));
             for (uint32_t i = 0; i < count; ++i) {
@@ -379,6 +401,7 @@ public:
             lastRefill_ = Clock::now();
         }
         Sleep(250);
+        awaitSeq_.store(0, std::memory_order_release);  // ответы пришли или потеряны: не ждать их
         res.sent = static_cast<uint32_t>(seqs.size());
         std::vector<double> rtt;
         {
@@ -443,6 +466,8 @@ public:
         s.unmatched = net_.unmatched.load();
         s.junk = net_.junk.load();
         s.pacerWaits = net_.pacerWaits.load();
+        s.rxSends = net_.rxSends.load();
+        s.replyTimeouts = net_.replyTimeouts.load();
         s.sendBusy = net_.sendBusy.load();
         const int64_t a = net_.firstSend.load();
         const int64_t b = net_.lastSend.load();
@@ -467,13 +492,21 @@ public:
 
     [[nodiscard]] std::string extraStats() const override {
         const NetSnapshot n = netStats();
+        char pace[160];
+        if (replyPaced()) {
+            std::snprintf(pace, sizeof(pace), "темп по ответам: сразу по ответу %llu, по тайм-ауту %llu, дельта ждала %llu",
+                u(n.rxSends), u(n.replyTimeouts), u(n.pacerWaits));
+        } else {
+            std::snprintf(pace, sizeof(pace), "ждали темп %llu (ведро: интервал %.0f мкс, ёмкость %.1f)", u(n.pacerWaits),
+                gapUs(), burst());
+        }
         char buf[1024];
         std::snprintf(buf, sizeof(buf),
             "udp %s: датаграмм %llu (%.0f/с) | ждали ответа %llu, пришло %llu, без ответа %lld | RTT p50 %.2f p99 %.2f"
-            " max %.2f мс | ждали темп %llu (интервал %.0f мкс) | чужих %llu, мусор %llu, send занят %llu",
+            " max %.2f мс | %s | чужих %llu, мусор %llu, send занят %llu",
             endpoint_.c_str(), u(n.datagrams), n.spanS > 0 ? n.datagrams / n.spanS : 0.0, u(n.expected), u(n.replies),
             static_cast<long long>(n.expected) - static_cast<long long>(n.replies), n.rttP50Ms, n.rttP99Ms, n.rttMaxMs,
-            u(n.pacerWaits), gapUs(), u(n.unmatched), u(n.junk), u(n.sendBusy));
+            pace, u(n.unmatched), u(n.junk), u(n.sendBusy));
         std::string out = buf;
         if (format_ == Format::RawMove) {
             const RawSnapshot r = rawStats();
@@ -541,8 +574,14 @@ private:
         lastRefill_ = now;
         return tokens_ >= 1.0;
     }
-    void waitPacerLocked() {
-        while (!pacerReady(Clock::now())) YieldProcessor();
+    // Под sendMutex_. Можно ли отправить следующую датаграмму сейчас.
+    // Reply: предыдущая датаграмма с ответом уже получила его (или ждём дольше kReplyWaitUs).
+    bool paceReady(int64_t now) {
+        if (!replyPaced()) return pacerReady(now);
+        return awaitSeq_.load(std::memory_order_acquire) == 0 || now - awaitT_ >= Clock::fromUs(kReplyWaitUs);
+    }
+    void waitPaceLocked() {
+        while (!paceReady(Clock::now())) YieldProcessor();
     }
 
     // Под sendMutex_. Датаграмма = обёртка + один кадр.
@@ -567,9 +606,21 @@ private:
             std::lock_guard<std::mutex> lock(sentMutex_);
             sent_[seq & kSentMask] = Sent{seq, now, id, kind, expect, false, 0.0f};
         }
+        // Датаграмма с ответом открывает следующую (Pace::Reply). Ставим до send(),
+        // чтобы ответ не мог обогнать запись.
+        const uint64_t prevAwait = awaitSeq_.load(std::memory_order_acquire);
+        const int64_t prevAwaitT = awaitT_;
+        if (expect) {
+            awaitT_ = now;
+            awaitSeq_.store(seq, std::memory_order_release);
+        }
         const int rc = ::send(sock_, reinterpret_cast<const char*>(d.data()), static_cast<int>(n), 0);
         if (rc != static_cast<int>(n)) {
             const int e = WSAGetLastError();
+            if (expect) {
+                uint64_t mine = seq;
+                if (awaitSeq_.compare_exchange_strong(mine, prevAwait)) awaitT_ = prevAwaitT;
+            }
             std::lock_guard<std::mutex> lock(sentMutex_);
             sent_[seq & kSentMask].seq = 0;
             if (e == WSAEWOULDBLOCK) {
@@ -581,6 +632,10 @@ private:
             return false;
         }
         tokens_ -= 1.0;
+        // Ушли, хотя предыдущая ещё ждала ответа: разрешил тайм-аут kReplyWaitUs.
+        if (expect && prevAwait != 0 && kind != Kind::Probe && replyPaced()) {
+            net_.replyTimeouts.fetch_add(1, std::memory_order_relaxed);
+        }
         net_.datagrams.fetch_add(1, std::memory_order_relaxed);
         if (expect) net_.expected.fetch_add(1, std::memory_order_relaxed);
         int64_t zero = 0;
@@ -619,10 +674,12 @@ private:
     };
     struct NetStats {
         std::atomic<uint64_t> datagrams{0}, expected{0}, replies{0}, unmatched{0}, junk{0}, pacerWaits{0}, sendBusy{0};
+        std::atomic<uint64_t> rxSends{0}, replyTimeouts{0};
         std::atomic<int64_t> firstSend{0}, lastSend{0};
         std::atomic<double> rttMaxUs{0.0};
         void reset() {
             datagrams = expected = replies = unmatched = junk = pacerWaits = sendBusy = 0;
+            rxSends = replyTimeouts = 0;
             firstSend = lastSend = 0;
             rttMaxUs = 0.0;
         }
@@ -667,8 +724,44 @@ private:
             return false;
         }
         std::lock_guard<std::mutex> sendLock(sendMutex_);
+        return moveRawLocked(dx, dy, flushOnly, nullptr);
+    }
+
+    // Pace::Reply, поток тайминга: дельта всегда уходит в перенос транспорта (путь у нас),
+    // отправку делает pumpLocked() - здесь, если ответ на датаграмму в полёте уже пришёл,
+    // иначе поток приёма сразу по ответу. Если поток приёма как раз отправляет, не ждём его.
+    bool moveRawReply(int16_t dx, int16_t dy) {
+        if (!rawMode_.load()) {
+            failed_ = true;
+            return false;
+        }
+        if (dx != 0 || dy != 0) {
+            std::lock_guard<std::mutex> lock(rawMutex_);
+            rawCarryX_ += dx;
+            rawCarryY_ += dy;
+        }
+        std::unique_lock<std::mutex> sendLock(sendMutex_, std::try_to_lock);
+        bool sent = false;
+        if (sendLock.owns_lock()) sent = pumpLocked(false);
+        if (!sent && (dx != 0 || dy != 0)) net_.pacerWaits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Под sendMutex_. Pace::Reply: одна датаграмма, если можно - новая дельта из переноса
+    // или квитанция/опрос. true - датаграмма ушла.
+    bool pumpLocked(bool fromRx) {
+        if (!rawMode_.load() || failed_.load()) return false;
+        bool sent = false;
+        (void)moveRawLocked(0, 0, true, &sent);
+        if (sent && fromRx) net_.rxSends.fetch_add(1, std::memory_order_relaxed);
+        return sent;
+    }
+
+    // Под sendMutex_. sent - ушла ли датаграмма (дельта, квитанция или опрос).
+    bool moveRawLocked(int16_t dx, int16_t dy, bool flushOnly, bool* sent) {
+        if (sent) *sent = false;
         const int64_t now = Clock::now();
-        if (!pacerReady(now)) {
+        if (!paceReady(now)) {
             if (!flushOnly) net_.pacerWaits.fetch_add(1, std::memory_order_relaxed);
             return flushOnly;
         }
@@ -738,9 +831,9 @@ private:
                 plen = 5;
                 op = kOpRawAck;
                 kind = consume ? Kind::RawAck : Kind::RawQuery;
-                if (!flushOnly) raw_.ackTurns.fetch_add(1, std::memory_order_relaxed);
+                if (!flushOnly || carry) raw_.ackTurns.fetch_add(1, std::memory_order_relaxed);
             } else {
-                if (!flushOnly) raw_.windowFull.fetch_add(1, std::memory_order_relaxed);
+                if (!flushOnly || carry) raw_.windowFull.fetch_add(1, std::memory_order_relaxed);
                 return flushOnly;
             }
         }
@@ -759,6 +852,7 @@ private:
             }
             return false;
         }
+        if (sent) *sent = true;
         if (submitted) {
             stats.noteCall(Clock::toUs(Clock::now() - t0));
             stats.writes.fetch_add(1, std::memory_order_relaxed);
@@ -882,16 +976,26 @@ private:
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         std::array<uint8_t, 2048> buf{};
         while (!stopRx_.load()) {
+            const bool reply = replyPaced();
             fd_set set;
             FD_ZERO(&set);
             FD_SET(sock_, &set);
-            timeval tv{0, 50000};
+            // Pace::Reply: просыпаться и без ответов - досылать созревшие квитанции
+            // и переходить дальше после тайм-аута ответа.
+            timeval tv{0, reply ? 1000 : 50000};
             const int ready = ::select(0, &set, nullptr, nullptr, &tv);
-            if (ready <= 0) continue;
-            for (;;) {
-                const int n = ::recv(sock_, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
-                if (n <= 0) break;  // WSAEWOULDBLOCK - всё прочитано
-                onDatagram(buf.data(), static_cast<size_t>(n), Clock::now());
+            if (ready > 0) {
+                for (;;) {
+                    const int n = ::recv(sock_, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
+                    if (n <= 0) break;  // WSAEWOULDBLOCK - всё прочитано
+                    onDatagram(buf.data(), static_cast<size_t>(n), Clock::now());
+                }
+            }
+            if (reply && rawMode_.load(std::memory_order_relaxed)) {
+                // Сразу по ответу: следующая датаграмма попадёт в "слот" платы до конца цикла.
+                // Отправку держит другой поток - не ждём (приём не должен вставать).
+                std::unique_lock<std::mutex> lock(sendMutex_, std::try_to_lock);
+                if (lock.owns_lock()) (void)pumpLocked(ready > 0);
             }
         }
     }
@@ -929,6 +1033,8 @@ private:
             Sent& s = sent_[seq & kSentMask];
             if (s.seq == seq && s.expect && !s.replied) {
                 s.replied = true;
+                uint64_t await = seq;  // ответ на датаграмму в полёте открывает следующую
+                awaitSeq_.compare_exchange_strong(await, 0, std::memory_order_acq_rel);
                 const double us = Clock::toUs(now - s.t);
                 s.rttMs = static_cast<float>(us / 1000.0);
                 info = s;
@@ -972,7 +1078,8 @@ private:
     SOCKET sock_ = INVALID_SOCKET;
     bool wsaStarted_ = false;
     Wire wire_ = Wire::Raw;
-    Format format_ = Format::RawMove;
+    std::atomic<Format> format_{Format::RawMove};  // читает и поток приёма
+    std::atomic<Pace> pace_{Pace::Reply};
     std::string endpoint_;
     uint8_t kinds_ = 0;
     uint32_t firmware_ = 0;
@@ -985,6 +1092,8 @@ private:
     double tokens_ = 1.0;
     double burst_ = kDefaultBurst;
     int64_t lastRefill_ = 0;
+    std::atomic<uint64_t> awaitSeq_{0};  // Pace::Reply: датаграмма в полёте (0 - ответ пришёл)
+    int64_t awaitT_ = 0;                 // когда она ушла (под sendMutex_)
 
     mutable std::mutex sentMutex_;
     std::array<Sent, kSentSize> sent_{};

@@ -60,6 +60,7 @@ struct Options {
     std::string host = "192.168.50.175";
     uint16_t port = 8080;
     RawUdpTransport::Wire wire = RawUdpTransport::Wire::Raw;
+    RawUdpTransport::Pace pace = RawUdpTransport::Pace::Reply;
     double gapUs = RawUdpTransport::kDefaultGapUs;
     double burst = RawUdpTransport::kDefaultBurst;
     double hz = 1000.0;
@@ -153,9 +154,12 @@ void printUsage() {
         "  --udp-port N         UDP-порт (8080)\n"
         "  --wire raw|host      обёртка: raw = 0x55 + nonce 8 байт + кадр (по умолчанию, работает на 4094);\n"
         "                       host = голый кадр (на 4094 плата не отвечает)\n"
-        "  --gap-us N           минимальный интервал между датаграммами, мкс (по умолчанию 1800: плата\n"
+        "  --pace reply|bucket  темп датаграмм rawmove: reply (по умолчанию) = одна датаграмма в полёте,\n"
+        "                       следующая сразу по ответу (~580/с без потерь, Raw ~290 Гц); bucket = ведро\n"
+        "                       --gap-us/--burst (500/с, Raw 250 Гц). 0x18/0x67 всегда идут через ведро\n"
+        "  --gap-us N           ведро: минимальный интервал между датаграммами, мкс (по умолчанию 1800: плата\n"
         "                       принимает ~583 датаграммы/с, чаще - теряет)\n"
-        "  --burst B            ёмкость ведра темпа, датаграмм (по умолчанию 1 = строго не чаще раза в 2 мс\n"
+        "  --burst B            ведро: ёмкость, датаграмм (по умолчанию 1 = строго не чаще раза в 2 мс\n"
         "                       на сетке тиков 1 мс, без потерь; 2 = изредка 1 мс: +11%% темпа, ~2%% потерь)\n"
         "  --tx rawmove|move|movenow  формат (по умолчанию rawmove = 0x69 + квитанции 0x6A; move = 0x18,\n"
         "                       movenow = 0x67 - через интерполятор прошивки)\n"
@@ -190,6 +194,11 @@ bool parseOptions(int argc, char** argv, Options& o) {
             const std::string v = next("--wire");
             if (v == "raw") o.wire = RawUdpTransport::Wire::Raw;
             else if (v == "host") o.wire = RawUdpTransport::Wire::Host;
+            else return false;
+        } else if (a == "--pace") {
+            const std::string v = next("--pace");
+            if (v == "reply") o.pace = RawUdpTransport::Pace::Reply;
+            else if (v == "bucket") o.pace = RawUdpTransport::Pace::Bucket;
             else return false;
         } else if (a == "--gap-us") o.gapUs = std::atof(next("--gap-us"));
         else if (a == "--burst") o.burst = std::atof(next("--burst"));
@@ -268,10 +277,12 @@ public:
         }
         tx_.setGapUs(opt.gapUs);
         tx_.setBurst(opt.burst);
-        std::printf("[+] MAKCU %s: прошивка %u, DEVICE kinds 0x%02X%s | темп датаграмм: в среднем раз в %.0f мкс,"
-                    " ведро %.1f\n",
+        tx_.setPace(opt.pace);
+        std::printf("[+] MAKCU %s: прошивка %u, DEVICE kinds 0x%02X%s | темп датаграмм rawmove: %s | ведро (0x18/0x67%s):"
+                    " в среднем раз в %.0f мкс, ёмкость %.1f\n",
             tx_.endpoint().c_str(), tx_.firmware(), tx_.deviceKinds(), (tx_.deviceKinds() & 1) ? " (mouse OK)" : "",
-            tx_.gapUs(), tx_.burst());
+            opt.pace == RawUdpTransport::Pace::Reply ? "по ответам, одна в полёте" : "ведро",
+            opt.pace == RawUdpTransport::Pace::Bucket ? ", rawmove" : "", tx_.gapUs(), tx_.burst());
         if (!(tx_.deviceKinds() & 1)) {
             std::printf("[-] Маршрут мыши не активен (DEVICE не содержит mouse).\n");
             return false;
