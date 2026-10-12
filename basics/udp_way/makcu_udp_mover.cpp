@@ -25,13 +25,18 @@ using namespace mover;
 
 namespace {
 
-// rawmove - 0x69 RAW_MOVE + квитанции 0x6A (один HID-отчёт на запрос, мимо AUTO);
+// batch   - 0x6C (V4.097+): до 7 Raw-записей в датаграмме, одна квитанция на пакет (~1000 Гц);
+// rawmove - 0x69 RAW_MOVE + квитанции 0x6A (один HID-отчёт на запрос, мимо AUTO, ~290 Гц по UDP);
 // move    - MAK_API MOVE 0x18 (интерполятор прошивки);
 // movenow - MOVE_NOW 0x67 (на 4094 тоже интерполятор).
-enum class TxKind { RawMove, Move, MoveNow };
+enum class TxKind { Batch, RawMove, Move, MoveNow };
+
+// Прошивка, с которой есть batch 0x6C (тест-сборка V4.097).
+constexpr uint32_t kBatchFirmware = 4097;
 
 const char* txName(TxKind k) {
     switch (k) {
+    case TxKind::Batch: return "batch";
     case TxKind::RawMove: return "rawmove";
     case TxKind::Move: return "move";
     case TxKind::MoveNow: return "movenow";
@@ -40,7 +45,7 @@ const char* txName(TxKind k) {
 }
 
 std::optional<TxKind> parseTx(const std::string& v) {
-    for (TxKind k : {TxKind::RawMove, TxKind::Move, TxKind::MoveNow}) {
+    for (TxKind k : {TxKind::Batch, TxKind::RawMove, TxKind::Move, TxKind::MoveNow}) {
         if (v == txName(k)) return k;
     }
     return std::nullopt;
@@ -65,6 +70,8 @@ struct Options {
     double burst = RawUdpTransport::kDefaultBurst;
     double hz = 1000.0;
     TxKind tx = TxKind::RawMove;
+    bool txSet = false;           // --tx задан явно (иначе batch на прошивке >= 4097)
+    double buttonsS = 0.0;        // --buttons S: показать кнопки S секунд и выйти
     std::vector<TxKind> compare;  // --compare: форматы для сравнения
     std::vector<double> rates;    // --rates: частоты команд для --sweep/--compare
     int interp = -1;              // --interp: 0..100 или 255 (AUTO), live через 0x1F; -1 - не трогать
@@ -161,8 +168,9 @@ void printUsage() {
         "                       принимает ~583 датаграммы/с, чаще - теряет)\n"
         "  --burst B            ведро: ёмкость, датаграмм (по умолчанию 1 = строго не чаще раза в 2 мс\n"
         "                       на сетке тиков 1 мс, без потерь; 2 = изредка 1 мс: +11%% темпа, ~2%% потерь)\n"
-        "  --tx rawmove|move|movenow  формат (по умолчанию rawmove = 0x69 + квитанции 0x6A; move = 0x18,\n"
-        "                       movenow = 0x67 - через интерполятор прошивки)\n"
+        "  --tx batch|rawmove|move|movenow  формат: batch = 0x6C, до 7 Raw-записей в датаграмме, ~1000 Гц\n"
+        "                       (по умолчанию на прошивке >= 4097); rawmove = 0x69 + квитанции 0x6A, ~290 Гц\n"
+        "                       (по умолчанию на старых); move = 0x18, movenow = 0x67 - через интерполятор\n"
         "  --interp auto|N      интерполяция 0x1F live (255 = AUTO), при выходе вернётся. На raw не влияет\n"
         "  --hz N               частота тиков, Гц (1000)\n"
         "  --compare A,B,..     сравнить форматы на частотах --rates (мышь не трогать)\n"
@@ -175,6 +183,8 @@ void printUsage() {
         "  --sweep              перебор частот --rates и выход\n"
         "  --check              связь + Raw API + RTT/потери на запросах 0x6A(id=0), курсор стоит\n"
         "  --netprobe           замер приёма платы: потери/RTT по интервалу датаграмм, курсор стоит\n"
+        "  --buttons S          S секунд показывать кнопки мыши (нажимайте), курсор стоит. В меню нажатия\n"
+        "                       показываются всегда\n"
         "  --wait spin|hybrid, --core N, --delay S, --keep-accel   как у COM-стенда\n");
 }
 
@@ -207,6 +217,7 @@ bool parseOptions(int argc, char** argv, Options& o) {
             const auto k = parseTx(next("--tx"));
             if (!k) return false;
             o.tx = *k;
+            o.txSet = true;
         } else if (a == "--compare") {
             for (const auto& v : splitList(next("--compare"))) {
                 const auto k = parseTx(v);
@@ -248,6 +259,7 @@ bool parseOptions(int argc, char** argv, Options& o) {
         else if (a == "--run") o.runOnce = true;
         else if (a == "--check") o.check = true;
         else if (a == "--netprobe") o.netProbe = true;
+        else if (a == "--buttons") o.buttonsS = std::atof(next("--buttons"));
         else if (a == "--sweep") o.sweep = true;
         else if (a == "--delay") o.startDelayS = std::atof(next("--delay"));
         else if (a == "--help" || a == "-h") {
@@ -288,6 +300,7 @@ public:
             return false;
         }
         if (auto km = tx_.kmQuery("m.device()")) reportUsbPeriod(*km);
+        std::printf("[+] Кнопки мыши: %s\n", tx_.buttonInfo().c_str());
         if (opt.interp >= 0) {
             interpOriginal_ = tx_.getInterp();
             if (!interpOriginal_) {
@@ -310,18 +323,24 @@ public:
     Transport* acquire(TxKind kind) {
         if (!tx_.isOpen()) return nullptr;
         using F = RawUdpTransport::Format;
-        const F want = kind == TxKind::RawMove ? F::RawMove : kind == TxKind::Move ? F::Mak : F::MoveNow;
-        if (want == F::RawMove && (tx_.format() != F::RawMove || !tx_.healthy())) {
-            tx_.setFormat(F::RawMove);
+        const F want = kind == TxKind::Batch     ? F::Batch
+                       : kind == TxKind::RawMove ? F::RawMove
+                       : kind == TxKind::Move    ? F::Mak
+                                                 : F::MoveNow;
+        const bool records = want == F::RawMove || want == F::Batch;
+        if (records && (tx_.format() != want || !tx_.healthy())) {
+            if (tx_.usesRecords() && tx_.format() != want) tx_.finishRaw(400);
+            tx_.setFormat(want);
             std::string info;
+            const char* what = want == F::Batch ? "Batch 0x6C" : "Raw movement 0x69/0x6A";
             if (!tx_.prepareRaw(info)) {
-                std::printf("[!] Raw movement 0x69/0x6A недоступен (%s) - использую MOVE 0x18\n", info.c_str());
+                std::printf("[!] %s недоступен (%s) - использую MOVE 0x18\n", what, info.c_str());
                 tx_.setFormat(F::Mak);
             } else {
-                std::printf("[+] Raw movement 0x69/0x6A: %s\n", info.c_str());
+                std::printf("[+] %s: %s\n", what, info.c_str());
             }
-        } else if (want != F::RawMove) {
-            if (tx_.format() == F::RawMove) tx_.finishRaw(400);
+        } else if (!records) {
+            if (tx_.usesRecords()) tx_.finishRaw(400);
             tx_.setFormat(want);
         }
         return &tx_;
@@ -332,7 +351,7 @@ public:
     // Интерполяция по кругу (F11): 0 -> AUTO -> 25 -> 50 -> 100 -> 0.
     void cycleInterp() {
         static constexpr uint8_t kSteps[] = {0, 255, 25, 50, 100};
-        if (tx_.format() == RawUdpTransport::Format::RawMove) tx_.finishRaw(400);
+        if (tx_.usesRecords()) tx_.finishRaw(400);
         const auto cur = tx_.getInterp();
         if (!cur) {
             std::printf("[!] Интерполяция 0x1F не прочитана\n");
@@ -367,7 +386,7 @@ public:
     }
 
     void shutdown() {
-        if (tx_.isOpen() && tx_.format() == RawUdpTransport::Format::RawMove) tx_.finishRaw(400);
+        if (tx_.isOpen() && tx_.usesRecords()) tx_.finishRaw(400);
         if (interpChanged_ && interpOriginal_ && tx_.isOpen()) {
             if (tx_.setInterp(*interpOriginal_)) {
                 std::printf("[+] Интерполяция 0x1F возвращена в %s\n", interpName(*interpOriginal_).c_str());
@@ -777,16 +796,66 @@ void runNetProbe(RawUdpTransport& udp, bool quick) {
     std::printf("  Потери при интервале < ~1.75 мс - предел приёма платы (~583 датаграммы/с), не сети.\n");
 }
 
+// Печатает каждое изменение кнопок мыши (маску ведёт транспорт по событиям 0x53).
+// Свой поток: видно и в меню, и во время прогонов.
+class ButtonWatcher {
+public:
+    void start(const RawUdpTransport& udp) {
+        if (!udp.buttonsAvailable() || thread_.joinable()) return;
+        udp_ = &udp;
+        stop_ = false;
+        t0_ = Clock::now();
+        thread_ = std::thread([this] { loop(); });
+    }
+    void stop() {
+        stop_ = true;
+        if (thread_.joinable()) thread_.join();
+    }
+    ~ButtonWatcher() { stop(); }
+
+private:
+    void loop() {
+        uint8_t last = udp_->buttons();
+        while (!stop_.load()) {
+            Sleep(1);
+            const uint8_t m = udp_->buttons();
+            if (m == last) continue;
+            last = m;
+            char names[64] = "";
+            for (int i = 0; i < RawUdpTransport::kButtonCount; ++i) {
+                if (!((m >> i) & 1u)) continue;
+                std::strcat(names, " ");
+                std::strcat(names, RawUdpTransport::buttonName(i));
+            }
+            std::printf("  [кнопки +%7.3f с] маска %02X%s\n", Clock::toUs(Clock::now() - t0_) / 1e6, m,
+                m ? names : "  (все отпущены)");
+            std::fflush(stdout);
+        }
+    }
+
+    const RawUdpTransport* udp_ = nullptr;
+    std::thread thread_;
+    std::atomic<bool> stop_{false};
+    int64_t t0_ = 0;
+};
+
+void printButtonTotals(const RawUdpTransport& udp) {
+    std::printf("нажатий:");
+    for (int i = 0; i < RawUdpTransport::kButtonCount; ++i) std::printf(" %s %u", RawUdpTransport::buttonName(i), udp.pressCount(i));
+    std::printf("\n");
+}
+
 void printMenu(Pattern pattern, const Options& o, TxKind kind, const std::string& interp) {
     std::printf("\n=================================================================================\n");
     std::printf(" Горячие клавиши (глобальные - держите в фокусе тестер поллинга):\n");
     for (const auto& p : kPresets) std::printf("   [%s] %s\n", p.key, p.title);
-    std::printf("   [F7] формат: сейчас %s -> rawmove / move (0x18) / movenow (0x67)\n", txName(kind));
+    std::printf("   [F7] формат: сейчас %s -> batch (0x6C) / rawmove / move (0x18) / movenow (0x67)\n", txName(kind));
     std::printf("   [F9] траектория (сейчас: %s)   скорость %.2f пикс/мс, размер %.0f, %.0f с\n", patternName(pattern),
         o.speed, o.size, o.durationS);
     std::printf("   [F11] интерполяция 0x1F: сейчас %s -> 0 / AUTO / 25 / 50 / 100 (live, при выходе вернётся)\n",
         interp.c_str());
     std::printf("   [F12] замер руки 15 с без инжекта      [ESC] / та же F-клавиша - стоп      [END] - выход\n");
+    std::printf("   Нажатия кнопок мыши печатаются строками [кнопки ...] (в меню и во время прогонов)\n");
     std::printf("=================================================================================\n");
 }
 
@@ -810,6 +879,28 @@ int main(int argc, char** argv) {
         link.shutdown();
         restoreProcessTiming();
         return 1;
+    }
+
+    if (opt.buttonsS > 0.0) {
+        RawUdpTransport& udp = link.udp();
+        if (!udp.buttonsAvailable()) {
+            std::printf("[-] Кнопки недоступны: %s\n", udp.buttonInfo().c_str());
+        } else {
+            ButtonWatcher watcher;
+            watcher.start(udp);
+            std::printf(">>> %.0f с: нажимайте кнопки мыши\n", opt.buttonsS);
+            const int64_t until = Clock::now() + Clock::fromUs(opt.buttonsS * 1e6);
+            for (int k = 0; Clock::now() < until && !g_exit.load(); ++k) {
+                Sleep(15);
+                if (k % 3 == 0) (void)udp.pollButtons();  // страховка: потерянное событие, брандмауэр
+            }
+            watcher.stop();
+            printButtonTotals(udp);
+            std::printf("%s\n", udp.extraStats().c_str());
+        }
+        link.shutdown();
+        restoreProcessTiming();
+        return 0;
     }
 
     if (opt.check || opt.netProbe) {
@@ -838,6 +929,11 @@ int main(int argc, char** argv) {
     if (!monitor.start()) std::printf("[!] Raw Input монитор не запустился - будет только статистика отправки\n");
 
     TxKind kind = opt.tx;
+    if (!opt.txSet && link.udp().firmware() >= kBatchFirmware) {
+        kind = TxKind::Batch;
+        std::printf("[+] Прошивка %u: формат batch 0x6C по умолчанию (--tx rawmove - старый путь)\n",
+            link.udp().firmware());
+    }
     if (!link.acquire(kind)) {
         g_hook.stop();
         monitor.stop();
@@ -881,13 +977,20 @@ int main(int argc, char** argv) {
     } else {
         Pattern pattern = opt.pattern;
         printMenu(pattern, opt, kind, link.interpNow());
+        ButtonWatcher buttonWatcher;
+        buttonWatcher.start(link.udp());
         KeyEdge keys;
         keys.sync();
-        while (!g_exit.load()) {
+        for (int idle = 0; !g_exit.load(); ++idle) {
             Sleep(15);
+            // Между прогонами - страховочный опрос 0x55 (во время прогона маску ведут события).
+            if (idle % 3 == 0) (void)link.udp().pollButtons();
             if (keys.pressed(VK_END)) break;
             if (keys.pressed(VK_F7)) {
-                kind = kind == TxKind::RawMove ? TxKind::Move : kind == TxKind::Move ? TxKind::MoveNow : TxKind::RawMove;
+                kind = kind == TxKind::Batch     ? TxKind::RawMove
+                       : kind == TxKind::RawMove ? TxKind::Move
+                       : kind == TxKind::Move    ? TxKind::MoveNow
+                                                 : TxKind::Batch;
                 (void)link.acquire(kind);
                 std::printf("[*] Формат: %s\n", txName(kind));
             }

@@ -33,6 +33,14 @@
 //             потолок ~290 движений/с (Reply) или 250 (Bucket).
 //   Mak     - MOVE 0x18 (без ответа): через интерполятор прошивки.
 //   MoveNow - MOVE_NOW 0x67 (без ответа): на 4094 тоже через интерполятор.
+//   Batch   - 0x6C (V4.097+): до 7 Raw-записей в одной датаграмме, одна квитанция на пакет.
+//             Каждый тик move() = одна запись = один HID-отчёт. В полёте один пакет; по
+//             квитанции поток приёма сразу шлёт следующий с накопившимися записями, X =
+//             старший терминальный id из квитанции (флаг bit0) освобождает записи платы.
+//             Квитанция освобождает не больше 7 строк, поэтому пакет не больше 7 записей;
+//             если за один оборот (~7 мс) накопилось больше, записи склеиваются в 7 (путь
+//             сохраняется, задержка не растёт). Непринятые записи (нет места) возвращаются
+//             в очередь. Замер 2026-10-12, V4.097: ~974 записей/с, HID 970 Гц, путь точный.
 //
 // Потери UDP в RawMove (путь не теряется и не дублируется):
 //   - нет ответа на 0x69 за kLostUs (8 мс): запрос 0x6A(id, consume=0). Ответ "нет
@@ -43,6 +51,13 @@
 //     (счётчик "неоднозначных": отказ 3 в этом случае был бы не виден).
 //   - перестановка/дубли: ответ сопоставляется с запросом по nonce, повторный
 //     ответ по закрытой записи игнорируется (счётчик поздних ответов).
+//
+// Кнопки мыши (2026-10-12): open() включает поток INPUT_STREAM mouse (0x52), события
+// INPUT_CHANGE 0x53 разбирает поток приёма; стартовая маска и pollButtons() - GET
+// PHYS_BUTTONS 0x55 (pollButtons() - только между прогонами). close() возвращает поток.
+// События плата шлёт с порта, равного нашему (не 8080), поэтому сокет без connect():
+// принимаются любые датаграммы с IP платы. На сети Public брандмауэр Windows режет их
+// без разрешающего правила - тогда маску держит только pollButtons().
 //
 // Контракт как у RawComTransport: move()/finish() из одного потока (поток
 // тайминга), query()/prepareRaw() - когда прогон не идёт; свой поток приёма.
@@ -61,6 +76,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -76,7 +92,7 @@ namespace mover {
 class RawUdpTransport final : public Transport {
 public:
     enum class Wire { Raw, Host };  // 0x55+nonce / голый кадр
-    enum class Format { RawMove, Mak, MoveNow };
+    enum class Format { RawMove, Mak, MoveNow, Batch };
     enum class Pace { Reply, Bucket };  // темп датаграмм: по ответам / ведро токенов
 
     static constexpr double kDefaultGapUs = 1800.0;
@@ -141,8 +157,12 @@ public:
         WSAIoctl(sock_, SIO_UDP_CONNRESET, &off, sizeof(off), nullptr, 0, &bytes, nullptr, nullptr);
         int rcvbuf = 1 << 20;
         setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
-        if (::connect(sock_, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote)) != 0) {
-            error = "connect() failed, WSA " + std::to_string(WSAGetLastError());
+        // Без connect(): события 0x53 приходят с другого порта платы (см. шапку).
+        remote_ = remote;
+        sockaddr_in local{};
+        local.sin_family = AF_INET;
+        if (::bind(sock_, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0) {
+            error = "bind() failed, WSA " + std::to_string(WSAGetLastError());
             close();
             return false;
         }
@@ -166,10 +186,18 @@ public:
         }
         kinds_ = (*kinds)[0];
         if (auto fw = query(kOpFirmware, nullptr, 0, 150, 3); fw && fw->size() == 4) firmware_ = le32(fw->data());
+        initButtons();
         return true;
     }
 
     void close() {
+        if (sock_ != INVALID_SOCKET && streamRestore_) {
+            // Вернуть INPUT_STREAM mouse, каким он был до open().
+            const uint8_t restore[2] = {0x01, *streamRestore_};
+            (void)sendFire(kOpInputStream, restore, 2);
+        }
+        streamRestore_.reset();
+        buttonsOk_ = false;
         rawMode_ = false;
         stopRx_ = true;
         if (rx_.joinable()) rx_.join();
@@ -187,6 +215,34 @@ public:
     [[nodiscard]] const std::string& endpoint() const { return endpoint_; }
     [[nodiscard]] uint8_t deviceKinds() const { return kinds_; }
     [[nodiscard]] uint32_t firmware() const { return firmware_; }
+
+    // ---- кнопки мыши ------------------------------------------------------------------
+    // Маска физических кнопок: bit0 левая, bit1 правая, bit2 средняя, bit3 side1, bit4 side2.
+    // Любой поток, не блокируют. Обновляется событием 0x53 сразу по нажатию.
+    static constexpr int kButtonCount = 5;
+    static const char* buttonName(int i) {
+        static const char* const kNames[kButtonCount] = {"left", "right", "middle", "side1", "side2"};
+        return i >= 0 && i < kButtonCount ? kNames[i] : "?";
+    }
+    [[nodiscard]] uint8_t buttons() const { return mask_.load(std::memory_order_acquire); }
+    [[nodiscard]] bool buttonDown(int i) const { return (buttons() >> i) & 1u; }
+    // Нажатий (переходов 0 -> 1) с open(); кнопка, зажатая при open(), не считается.
+    [[nodiscard]] uint32_t pressCount(int i) const { return presses_[i].load(std::memory_order_acquire); }
+    [[nodiscard]] bool buttonsAvailable() const { return buttonsOk_.load(); }
+    [[nodiscard]] uint64_t buttonEvents() const { return buttonEvents_.load(); }
+    // Событий нет, а опрос уже находил изменения: их режет брандмауэр (или поток выключен).
+    [[nodiscard]] bool buttonEventsMissing() const { return buttonEvents_.load() == 0 && buttonMissed_.load() >= 2; }
+    [[nodiscard]] const std::string& buttonInfo() const { return buttonInfo_; }
+    // Перечитать маску (0x55). Только когда прогон не идёт (как query()): исправляет маску,
+    // если событие потерялось, и держит её, если события не доходят совсем.
+    bool pollButtons() {
+        if (!buttonsOk_.load()) return false;
+        auto m = query(kOpPhysButtons, nullptr, 0, 60, 1);
+        if (!m || m->size() != 1) return false;
+        buttonPolls_.fetch_add(1, std::memory_order_relaxed);
+        applyMask((*m)[0], true);
+        return true;
+    }
 
     void setFormat(Format f) { format_ = f; }
     [[nodiscard]] Format format() const { return format_; }
@@ -215,17 +271,24 @@ public:
         case Format::RawMove: return "udp-raw69";
         case Format::Mak: return "udp-0x18";
         case Format::MoveNow: return "udp-0x67";
+        case Format::Batch: return "udp-batch6c";
         }
         return "udp";
     }
 
     [[nodiscard]] bool healthy() const override {
-        return sock_ != INVALID_SOCKET && !failed_.load() && (format_ != Format::RawMove || rawMode_.load());
+        return sock_ != INVALID_SOCKET && !failed_.load() && (!usesRecords() || rawMode_.load());
+    }
+    // Формат держит записи Raw на плате (0x69 или 0x6C): нужны prepareRaw()/finishRaw().
+    [[nodiscard]] bool usesRecords() const {
+        const Format f = format_.load();
+        return f == Format::RawMove || f == Format::Batch;
     }
 
     // ---- горячий путь ---------------------------------------------------------
     [[nodiscard]] bool move(int16_t dx, int16_t dy) override {
         if (!healthy()) return false;
+        if (format_ == Format::Batch) return moveBatch(dx, dy);
         if (format_ == Format::RawMove) {
             return pace_ == Pace::Reply ? moveRawReply(dx, dy) : moveRaw(dx, dy, dx == 0 && dy == 0);
         }
@@ -250,12 +313,17 @@ public:
     // Квитанции и перенос без новой дельты.
     void service() {
         if (healthy() && format_ == Format::RawMove) (void)moveRaw(0, 0, true);
+        if (healthy() && format_ == Format::Batch) {
+            std::lock_guard<std::mutex> lock(sendMutex_);
+            (void)pumpBatchLocked(false);
+        }
     }
 
     void finish() override { (void)finishRaw(400); }
 
     // true - все записи квитированы, перенос (0,0).
     bool finishRaw(int timeoutMs) {
+        if (format_ == Format::Batch) return healthy() ? finishBatch(timeoutMs) : true;
         if (format_ != Format::RawMove || !healthy()) return true;
         const int64_t until = Clock::now() + Clock::fromUs(timeoutMs * 1000.0);
         while (Clock::now() < until && healthy()) {
@@ -353,7 +421,13 @@ public:
             rawCarryY_ = 0;
             for (auto& r : rawRec_) r = RawRecord{};
             rawWindow_ = std::clamp<uint32_t>(meta->freeRecords > 2 ? meta->freeRecords - 2u : 1u, 1u, kRawMaxLive);
+            batchPend_.clear();
+            batchFlight_ = BatchFlight{};
+            batchHaveX_ = false;
+            batchMaxTerm_ = 0;
         }
+        batchAwait_.store(0, std::memory_order_release);
+        batchMetaPending_ = false;
         rawMode_ = true;
         if (rawWindow_ < kRawMaxLive) info += "; окно уменьшено до " + std::to_string(rawWindow_);
         return true;
@@ -508,6 +582,27 @@ public:
             static_cast<long long>(n.expected) - static_cast<long long>(n.replies), n.rttP50Ms, n.rttP99Ms, n.rttMaxMs,
             pace, u(n.unmatched), u(n.junk), u(n.sendBusy));
         std::string out = buf;
+        if (format_ == Format::Batch) {
+            uint32_t pending = 0;
+            {
+                std::lock_guard<std::mutex> lock(rawMutex_);
+                pending = static_cast<uint32_t>(batchPend_.size());
+            }
+            const auto& b = batch_;
+            const uint64_t pk = b.packets.load();
+            const uint32_t minFree = b.minFree.load();
+            std::snprintf(buf, sizeof(buf),
+                "\nbatch 0x6C: пакетов %llu, записей %llu (%.2f/пакет), принято платой %llu | квитанций %llu: частичных %llu"
+                " (нет места), ошибок конверта %llu (X отклонён %llu), непонятных %llu | потеряно квитанций %llu, опросов %llu"
+                " | освобождено %llu, мин. свободно %d, 'more' %llu | терминальных: отдано %llu, отказ %llu"
+                " | склеено записей %llu, max в очереди %u, в очереди %u | посл. причина %u",
+                u(pk), u(b.records.load()), pk ? static_cast<double>(b.records.load()) / static_cast<double>(pk) : 0.0,
+                u(b.admitted.load()), u(b.receipts.load()), u(b.partial.load()), u(b.envelope.load()), u(b.xRejected.load()),
+                u(b.badReply.load()), u(b.lostReceipts.load()), u(b.metaQueries.load()), u(b.freed.load()),
+                minFree > 255 ? -1 : static_cast<int>(minFree), u(b.moreSet.load()), u(b.termSubmitted.load()),
+                u(b.termRejected.load()), u(b.merged.load()), b.maxPending.load(), pending, raw_.lastReason.load());
+            out += buf;
+        }
         if (format_ == Format::RawMove) {
             const RawSnapshot r = rawStats();
             std::snprintf(buf, sizeof(buf),
@@ -522,12 +617,19 @@ public:
                 static_cast<long long>(r.carryX), static_cast<long long>(r.carryY), r.lastReason);
             out += buf;
         }
+        if (buttonsOk_.load()) {
+            std::snprintf(buf, sizeof(buf), "\nкнопки %02X: событий 0x53 %llu, переполнений %llu, опросов 0x55 %llu, найдено опросом %llu%s",
+                buttons(), u(buttonEvents_.load()), u(buttonOverflows_.load()), u(buttonPolls_.load()),
+                u(buttonMissed_.load()), buttonEventsMissing() ? " | СОБЫТИЯ НЕ ДОХОДЯТ (брандмауэр?)" : "");
+            out += buf;
+        }
         return out;
     }
 
     void resetStats() override {
         stats.reset();
         raw_.reset();
+        batch_.reset();
         net_.reset();
         for (auto& h : rttHist_) h = 0;
     }
@@ -541,6 +643,10 @@ private:
     static constexpr uint8_t kOpRawMove = 0x69;
     static constexpr uint8_t kOpRawAck = 0x6A;
     static constexpr uint8_t kOpKmText = 0x6B;  // 'k' + текст без первой буквы
+    static constexpr uint8_t kOpBatch = 0x6C;   // V4.097+: пакет Raw-записей + квитанция
+    static constexpr uint8_t kOpInputStream = 0x52;  // GET kind -> enabled; SET kind enabled (без ответа)
+    static constexpr uint8_t kOpInputChange = 0x53;  // событие: kind:u8 id:u8 value:u8 (FF FF - переполнение)
+    static constexpr uint8_t kOpPhysButtons = 0x55;  // V4.036+: GET -> mask:u8 физических кнопок
 
     static unsigned long long u(uint64_t v) { return static_cast<unsigned long long>(v); }
     static uint32_t le32(const uint8_t* p) {
@@ -549,7 +655,7 @@ private:
     }
 
     // ---- отправка ---------------------------------------------------------------
-    enum class Kind : uint8_t { None, Sync, Probe, Fire, RawMove, RawAck, RawQuery };
+    enum class Kind : uint8_t { None, Sync, Probe, Fire, RawMove, RawAck, RawQuery, Batch, BatchMeta };
     struct Sent {
         uint64_t seq = 0;
         int64_t t = 0;
@@ -586,7 +692,7 @@ private:
 
     // Под sendMutex_. Датаграмма = обёртка + один кадр.
     bool sendLocked(uint8_t op, const uint8_t* payload, uint16_t len, Kind kind, uint32_t id) {
-        std::array<uint8_t, 96> d{};
+        std::array<uint8_t, 256> d{};
         size_t n = 0;
         const uint64_t seq = ++seq_;
         if (wire_ == Wire::Raw) {
@@ -614,7 +720,8 @@ private:
             awaitT_ = now;
             awaitSeq_.store(seq, std::memory_order_release);
         }
-        const int rc = ::send(sock_, reinterpret_cast<const char*>(d.data()), static_cast<int>(n), 0);
+        const int rc = ::sendto(sock_, reinterpret_cast<const char*>(d.data()), static_cast<int>(n), 0,
+            reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
         if (rc != static_cast<int>(n)) {
             const int e = WSAGetLastError();
             if (expect) {
@@ -957,6 +1064,320 @@ private:
         }
     }
 
+    // ---- Batch 0x6C (V4.097+) ------------------------------------------------------
+    // request = 01 | flags | N | 00 | X u32 | N x [id u32 | x i16 | y i16 | dt u16] (8 + 10N байт)
+    // receipt = [0]=1 [1]=0 все / 1 частично / 255 ошибка конверта [2]=N [3]=принято
+    //           [4]=первый отказ [5]=причина [6]=освобождено [7]=свободно [8]=K строк (<=7)
+    //           [9]=more [10]=в очереди [11]=0 [12..15]=last_id, затем K x (id u32 | state | reason).
+    // flags bit0: освободить терминальные записи с id <= X. X не больше старшего
+    // терминального id, уже сообщённого квитанцией, иначе 255/1 без последствий.
+    static constexpr size_t kBatchMax = 7;           // квитанция освобождает не больше 7 строк
+    static constexpr double kBatchLostUs = 30000.0;  // нет квитанции 30 мс - спросить last_accepted_id
+
+    struct BatchRec {
+        int32_t dx = 0;
+        int32_t dy = 0;
+    };
+    struct BatchFlight {
+        bool active = false;
+        uint32_t firstId = 0;
+        uint8_t n = 0;
+        std::array<BatchRec, kBatchMax> recs{};
+    };
+    struct BatchStats {
+        std::atomic<uint64_t> packets{0}, records{0}, admitted{0}, receipts{0}, partial{0}, envelope{0}, xRejected{0};
+        std::atomic<uint64_t> badReply{0}, lostReceipts{0}, metaQueries{0}, freed{0}, moreSet{0};
+        std::atomic<uint64_t> termSubmitted{0}, termRejected{0}, merged{0};
+        std::atomic<uint32_t> minFree{256}, maxPending{0};
+        void reset() {
+            packets = records = admitted = receipts = partial = envelope = xRejected = 0;
+            badReply = lostReceipts = metaQueries = freed = moreSet = 0;
+            termSubmitted = termRejected = merged = 0;
+            minFree = 256;
+            maxPending = 0;
+        }
+    };
+
+    // Поток тайминга: дельта тика = одна запись в очередь, отправка - если пакета в полёте нет.
+    bool moveBatch(int16_t dx, int16_t dy) {
+        if (!rawMode_.load()) {
+            failed_ = true;
+            return false;
+        }
+        if (dx != 0 || dy != 0) {
+            std::lock_guard<std::mutex> lock(rawMutex_);
+            batchPend_.push_back(BatchRec{dx, dy});
+            const auto n = static_cast<uint32_t>(batchPend_.size());
+            if (n > batch_.maxPending.load(std::memory_order_relaxed)) batch_.maxPending.store(n, std::memory_order_relaxed);
+        }
+        std::unique_lock<std::mutex> sendLock(sendMutex_, std::try_to_lock);
+        if (sendLock.owns_lock()) (void)pumpBatchLocked(false);
+        return true;
+    }
+
+    // Под rawMutex_: записи пакета с индекса from вернуть в начало очереди (порядок сохраняется).
+    void returnBatchLocked(const BatchFlight& f, uint8_t from) {
+        for (int i = static_cast<int>(f.n) - 1; i >= static_cast<int>(from); --i) batchPend_.push_front(f.recs[i]);
+    }
+
+    // Под sendMutex_. Следующий пакет из очереди, если предыдущий получил квитанцию.
+    // Без квитанции kBatchLostUs - опрос 0x6A(id=0): last_accepted_id покажет, что принято.
+    bool pumpBatchLocked(bool fromRx) {
+        if (!rawMode_.load() || failed_.load()) return false;
+        const int64_t now = Clock::now();
+        if (batchAwait_.load(std::memory_order_acquire) != 0) {
+            if (now - batchAwaitT_.load(std::memory_order_relaxed) < Clock::fromUs(kBatchLostUs)) return false;
+            if (!batchMetaPending_.load()) batch_.lostReceipts.fetch_add(1, std::memory_order_relaxed);
+            const uint8_t zero[5] = {0, 0, 0, 0, 0};
+            batchMetaPending_ = true;
+            batchAwaitT_.store(now, std::memory_order_relaxed);
+            batchAwait_.store(seq_ + 1, std::memory_order_release);  // sendLocked() возьмёт этот nonce
+            if (!sendLocked(kOpRawAck, zero, 5, Kind::BatchMeta, 0)) {
+                batchAwait_.store(0, std::memory_order_release);
+                return false;
+            }
+            batch_.metaQueries.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        BatchFlight f;
+        bool haveX = false;
+        uint32_t x = 0;
+        {
+            std::lock_guard<std::mutex> lock(rawMutex_);
+            if (batchPend_.empty()) return false;
+            const size_t k = batchPend_.size();
+            f.active = true;
+            f.firstId = rawNextId_;
+            if (k <= kBatchMax) {
+                f.n = static_cast<uint8_t>(k);
+                for (size_t i = 0; i < k; ++i) f.recs[i] = batchPend_[i];
+            } else {
+                // Накопилось больше, чем принимает пакет: склеить по порядку в 7 записей.
+                f.n = static_cast<uint8_t>(kBatchMax);
+                for (size_t i = 0; i < k; ++i) {
+                    BatchRec& r = f.recs[i * kBatchMax / k];
+                    r.dx += batchPend_[i].dx;
+                    r.dy += batchPend_[i].dy;
+                }
+                batch_.merged.fetch_add(k - kBatchMax, std::memory_order_relaxed);
+            }
+            batchPend_.clear();
+            // Поле записи i16: излишек склейки остаётся в очереди.
+            for (uint8_t i = 0; i < f.n; ++i) {
+                BatchRec& r = f.recs[i];
+                const int32_t cx = std::clamp<int32_t>(r.dx, -32767, 32767);
+                const int32_t cy = std::clamp<int32_t>(r.dy, -32767, 32767);
+                if (cx != r.dx || cy != r.dy) batchPend_.push_back(BatchRec{r.dx - cx, r.dy - cy});
+                r.dx = cx;
+                r.dy = cy;
+            }
+            haveX = batchHaveX_;
+            x = batchMaxTerm_;
+            batchFlight_ = f;
+        }
+        std::array<uint8_t, 8 + 10 * kBatchMax> pl{};
+        pl[0] = 0x01;
+        pl[1] = haveX ? 0x01 : 0x00;
+        pl[2] = f.n;
+        pl[3] = 0x00;
+        put32(pl.data() + 4, haveX ? x : 0);
+        for (uint8_t i = 0; i < f.n; ++i) {
+            uint8_t* r = pl.data() + 8 + 10 * i;
+            put32(r, f.firstId + i);
+            put16(r + 4, f.recs[i].dx);
+            put16(r + 6, f.recs[i].dy);
+            put16(r + 8, 0);  // dt
+        }
+        batchMetaPending_ = false;
+        batchAwaitT_.store(now, std::memory_order_relaxed);
+        batchAwait_.store(seq_ + 1, std::memory_order_release);
+        const int64_t t0 = Clock::now();
+        if (!sendLocked(kOpBatch, pl.data(), static_cast<uint16_t>(8 + 10 * f.n), Kind::Batch, f.firstId)) {
+            batchAwait_.store(0, std::memory_order_release);
+            std::lock_guard<std::mutex> lock(rawMutex_);
+            returnBatchLocked(f, 0);
+            batchFlight_.active = false;
+            return false;
+        }
+        stats.noteCall(Clock::toUs(Clock::now() - t0));
+        stats.writes.fetch_add(f.n, std::memory_order_relaxed);
+        batch_.packets.fetch_add(1, std::memory_order_relaxed);
+        batch_.records.fetch_add(f.n, std::memory_order_relaxed);
+        if (fromRx) net_.rxSends.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Поток приёма: квитанция на пакет в полёте.
+    void onBatchReceipt(const uint8_t* p, size_t plen) {
+        std::lock_guard<std::mutex> lock(rawMutex_);
+        const BatchFlight f = batchFlight_;
+        if (!f.active) {
+            raw_.lateReplies.fetch_add(1, std::memory_order_relaxed);  // пакет уже разобран опросом
+            return;
+        }
+        batchFlight_.active = false;
+        batchMetaPending_ = false;
+        batch_.receipts.fetch_add(1, std::memory_order_relaxed);
+        if (plen < 16 || p[0] != 1) {
+            // Не квитанция 0x6C (прошивка без batch?): записи назад, формат дальше не работает.
+            batch_.badReply.fetch_add(1, std::memory_order_relaxed);
+            returnBatchLocked(f, 0);
+            failed_ = true;
+            batchAwait_.store(0, std::memory_order_release);
+            return;
+        }
+        const uint8_t result = p[1];
+        const uint8_t adm = std::min(p[3], f.n);
+        const uint8_t reason = p[5];
+        const uint8_t k = p[8];
+        const uint32_t lastId = le32(p + 12);
+        if (result == 255) {
+            batch_.envelope.fetch_add(1, std::memory_order_relaxed);
+            raw_.lastReason.store(reason, std::memory_order_relaxed);
+            if (reason == 1) {
+                batch_.xRejected.fetch_add(1, std::memory_order_relaxed);
+                batchHaveX_ = false;
+            }
+            returnBatchLocked(f, 0);
+        } else {
+            if (result == 1) {
+                batch_.partial.fetch_add(1, std::memory_order_relaxed);
+                raw_.lastReason.store(reason, std::memory_order_relaxed);
+            }
+            batch_.admitted.fetch_add(adm, std::memory_order_relaxed);
+            returnBatchLocked(f, adm);
+            rawNextId_ = std::max(f.firstId + adm, adm ? lastId + 1 : f.firstId);
+        }
+        batch_.freed.fetch_add(p[6], std::memory_order_relaxed);
+        if (p[7] < batch_.minFree.load(std::memory_order_relaxed)) batch_.minFree.store(p[7], std::memory_order_relaxed);
+        if (p[9]) batch_.moreSet.fetch_add(1, std::memory_order_relaxed);
+        for (size_t i = 0; i < k && 16 + 6 * i + 6 <= plen; ++i) {
+            const uint8_t* row = p + 16 + 6 * i;
+            const uint32_t id = le32(row);
+            if (row[4] == 2) batch_.termSubmitted.fetch_add(1, std::memory_order_relaxed);
+            else if (row[4] == 3) batch_.termRejected.fetch_add(1, std::memory_order_relaxed);
+            if (id > batchMaxTerm_) batchMaxTerm_ = id;
+            batchHaveX_ = true;
+        }
+        batchAwait_.store(0, std::memory_order_release);
+    }
+
+    // Поток приёма: ответ на опрос после потерянной квитанции.
+    void onBatchMeta(uint32_t lastAccepted) {
+        std::lock_guard<std::mutex> lock(rawMutex_);
+        if (!batchMetaPending_.load()) return;  // квитанция всё-таки пришла раньше
+        const BatchFlight f = batchFlight_;
+        if (f.active) {
+            uint8_t adm = 0;
+            if (lastAccepted >= f.firstId) adm = static_cast<uint8_t>(std::min<uint32_t>(lastAccepted - f.firstId + 1, f.n));
+            batch_.admitted.fetch_add(adm, std::memory_order_relaxed);
+            returnBatchLocked(f, adm);
+            rawNextId_ = std::max(f.firstId + adm, lastAccepted + 1);
+            batchFlight_.active = false;
+        }
+        batchMetaPending_ = false;
+        batchAwait_.store(0, std::memory_order_release);
+    }
+
+    // Конец прогона: дослать очередь, дождаться квитанции и освободить записи, чьи
+    // терминальные строки пришли уже после последнего X.
+    bool finishBatch(int timeoutMs) {
+        const int64_t until = Clock::now() + Clock::fromUs(timeoutMs * 1000.0);
+        bool done = false;
+        while (Clock::now() < until && healthy()) {
+            {
+                std::lock_guard<std::mutex> lock(rawMutex_);
+                done = batchPend_.empty() && !batchFlight_.active && batchAwait_.load() == 0;
+            }
+            if (done) break;
+            {
+                std::lock_guard<std::mutex> lock(sendMutex_);
+                (void)pumpBatchLocked(false);
+            }
+            Sleep(1);
+        }
+        Sleep(30);  // последние записи уходят в USB по одной на опрос мыши
+        if (auto meta = queryRawMeta(); meta && meta->freeRecords < meta->capacity && meta->lastId > 0) {
+            (void)drainLeftoverRecords(meta->lastId, meta->capacity - meta->freeRecords);
+        }
+        return done;
+    }
+
+    static void put16(uint8_t* p, int32_t v) {
+        p[0] = static_cast<uint8_t>(v);
+        p[1] = static_cast<uint8_t>(v >> 8);
+    }
+    static void put32(uint8_t* p, uint32_t v) {
+        for (int i = 0; i < 4; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
+    }
+
+    // ---- кнопки -------------------------------------------------------------------------
+    // Команда без ответа (SET 0x52): по темпу, затем переждать передачу на второй чип.
+    bool sendFire(uint8_t op, const uint8_t* payload, uint16_t len) {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        waitPaceLocked();
+        const bool ok = sendLocked(op, payload, len, Kind::Fire, 0);
+        Sleep(5);
+        return ok;
+    }
+
+    // open(): включить поток событий мыши (запомнить, каким был), потом стартовая маска.
+    // Поток начинается с "всё отпущено", поэтому маска читается после включения.
+    void initButtons() {
+        mask_.store(0);
+        primed_.store(false);
+        for (auto& c : presses_) c.store(0);
+        buttonEvents_ = buttonOverflows_ = buttonPolls_ = buttonMissed_ = 0;
+        const uint8_t kind[1] = {0x01};
+        bool stream = false;
+        if (auto was = query(kOpInputStream, kind, 1, 100, 3); was && was->size() == 1) {
+            stream = true;
+            if ((*was)[0] != 1) {
+                const uint8_t on[2] = {0x01, 0x01};
+                if (sendFire(kOpInputStream, on, 2)) streamRestore_ = (*was)[0];
+            }
+        }
+        if (auto m = query(kOpPhysButtons, nullptr, 0, 100, 3); m && m->size() == 1) {
+            mask_.store((*m)[0]);
+            primed_.store(true);
+            buttonsOk_ = true;
+        }
+        char buf[160];
+        if (buttonsOk_) {
+            std::snprintf(buf, sizeof(buf), "маска %02X, события 0x53 %s", mask_.load(),
+                !stream ? "недоступны (нет ответа на 0x52)" : streamRestore_ ? "включены" : "уже были включены");
+        } else {
+            std::snprintf(buf, sizeof(buf), "0x55 не ответил (нужна V4.036+)");
+        }
+        buttonInfo_ = buf;
+    }
+
+    // Поток приёма: событие 0x53. Мышь: id = кнопка, value 0/1; FF FF - переполнение.
+    void onInputChange(const uint8_t* p, size_t plen) {
+        if (plen != 3 || p[0] != 1) return;  // не мышь (или колесо в тест-сборках, plen 4)
+        if (p[1] == 0xFF && p[2] == 0xFF) {
+            buttonOverflows_.fetch_add(1, std::memory_order_relaxed);  // поправит pollButtons()
+            return;
+        }
+        if (p[1] >= 8 || p[2] > 1) return;
+        buttonEvents_.fetch_add(1, std::memory_order_relaxed);
+        const uint8_t bit = static_cast<uint8_t>(1u << p[1]);
+        const uint8_t old = mask_.load(std::memory_order_acquire);
+        applyMask(p[2] ? static_cast<uint8_t>(old | bit) : static_cast<uint8_t>(old & ~bit), false);
+    }
+
+    // Новая маска; переходы 0 -> 1 - нажатия (после стартовой маски). fromPoll: изменение
+    // нашёл опрос, а не событие - признак потерянных событий.
+    void applyMask(uint8_t mask, bool fromPoll) {
+        const uint8_t old = mask_.exchange(mask, std::memory_order_acq_rel);
+        if (!primed_.load(std::memory_order_acquire) || old == mask) return;
+        if (fromPoll) buttonMissed_.fetch_add(1, std::memory_order_relaxed);
+        const uint8_t pressed = static_cast<uint8_t>(mask & ~old);
+        for (int i = 0; i < kButtonCount; ++i) {
+            if (pressed & (1u << i)) presses_[i].fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+
     // Подтвердить (consume=1) окончательные записи среди последних id: прерванные
     // сессии оставляют их на плате до перезагрузки. По одной датаграмме, до 1024 id.
     // ВНИМАНИЕ: подтверждает и записи другой программы, если она тоже шлёт Raw.
@@ -976,7 +1397,8 @@ private:
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         std::array<uint8_t, 2048> buf{};
         while (!stopRx_.load()) {
-            const bool reply = replyPaced();
+            const bool batch = format_.load(std::memory_order_relaxed) == Format::Batch;
+            const bool reply = replyPaced() || batch;
             fd_set set;
             FD_ZERO(&set);
             FD_SET(sock_, &set);
@@ -986,8 +1408,13 @@ private:
             const int ready = ::select(0, &set, nullptr, nullptr, &tv);
             if (ready > 0) {
                 for (;;) {
-                    const int n = ::recv(sock_, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
+                    sockaddr_in from{};
+                    int fromLen = sizeof(from);
+                    const int n = ::recvfrom(sock_, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0,
+                        reinterpret_cast<sockaddr*>(&from), &fromLen);
                     if (n <= 0) break;  // WSAEWOULDBLOCK - всё прочитано
+                    // Любой порт платы (ответы с 8080, события - с порта, равного нашему), чужие IP - мимо.
+                    if (from.sin_addr.s_addr != remote_.sin_addr.s_addr) continue;
                     onDatagram(buf.data(), static_cast<size_t>(n), Clock::now());
                 }
             }
@@ -995,7 +1422,7 @@ private:
                 // Сразу по ответу: следующая датаграмма попадёт в "слот" платы до конца цикла.
                 // Отправку держит другой поток - не ждём (приём не должен вставать).
                 std::unique_lock<std::mutex> lock(sendMutex_, std::try_to_lock);
-                if (lock.owns_lock()) (void)pumpLocked(ready > 0);
+                if (lock.owns_lock()) (void)(batch ? pumpBatchLocked(ready > 0) : pumpLocked(ready > 0));
             }
         }
     }
@@ -1025,6 +1452,12 @@ private:
         }
         const uint8_t op = f[4];
         const uint8_t* p = f + 5;
+        // Событие кнопок несёт nonce одной из наших прошлых команд: разбирать по опкоду ДО
+        // сопоставления по nonce, иначе оно "ответит" на команду в полёте.
+        if (op == kOpInputChange) {
+            onInputChange(p, plen);
+            return;
+        }
 
         Sent info{};
         bool matched = false;
@@ -1060,6 +1493,14 @@ private:
             }
         }
 
+        if (matched && info.kind == Kind::Batch) {
+            onBatchReceipt(p, plen);
+            return;
+        }
+        if (matched && info.kind == Kind::BatchMeta) {
+            if (plen == 8) onBatchMeta(le32(p + 2));
+            return;
+        }
         if ((op == kOpRawMove || op == kOpRawAck) && plen == 6 && rawMode_.load(std::memory_order_relaxed)) {
             Kind kind = matched ? info.kind : Kind::None;
             if (!hasSeq) {
@@ -1122,6 +1563,26 @@ private:
     int64_t rawCarryY_ = 0;
     std::atomic<bool> rawMode_{false};
     RawStats raw_;
+
+    // Batch 0x6C: очередь записей (по одной на тик), пакет в полёте, X для освобождения.
+    std::deque<BatchRec> batchPend_;         // под rawMutex_
+    BatchFlight batchFlight_;                // под rawMutex_
+    uint32_t batchMaxTerm_ = 0;              // под rawMutex_: старший терминальный id из квитанций
+    bool batchHaveX_ = false;                // под rawMutex_
+    std::atomic<uint64_t> batchAwait_{0};    // nonce пакета/опроса в полёте (0 - можно слать)
+    std::atomic<int64_t> batchAwaitT_{0};
+    std::atomic<bool> batchMetaPending_{false};
+    BatchStats batch_;
+
+    // Кнопки мыши: маску пишут поток приёма и pollButtons(), читают все.
+    sockaddr_in remote_{};                  // адрес платы (сокет без connect())
+    std::atomic<bool> buttonsOk_{false};
+    std::atomic<bool> primed_{false};       // стартовая маска получена (раньше - не нажатия)
+    std::optional<uint8_t> streamRestore_;  // INPUT_STREAM mouse до open(), если меняли
+    std::string buttonInfo_;
+    std::atomic<uint8_t> mask_{0};
+    std::array<std::atomic<uint32_t>, kButtonCount> presses_{};
+    std::atomic<uint64_t> buttonEvents_{0}, buttonOverflows_{0}, buttonPolls_{0}, buttonMissed_{0};
 };
 
 }  // namespace mover

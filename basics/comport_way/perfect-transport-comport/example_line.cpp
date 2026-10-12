@@ -1,7 +1,8 @@
 // Пример и самопроверка makcu_raw_transport.h.
 //
-//   example_line.exe [--port COM5] [--check]
-//     --check  открыть порт, показать сессию Raw и закрыть (курсор не двигается)
+//   example_line.exe [--port COM5] [--check] [--buttons S]
+//     --check      открыть порт, показать сессию Raw и закрыть (курсор не двигается)
+//     --buttons S  S секунд показывать кнопки мыши (нажимайте), курсор не двигается
 //     без него 2 с по X: 1 с вправо, 1 с влево по 2 отсчёта каждую 1 мс
 //              (итоговый путь 0, курсор вернётся на место), мышь не трогать
 //
@@ -19,11 +20,13 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     std::string port;
     bool check = false;
+    double buttonsS = 0.0;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = argv[++i];
         else if (std::strcmp(argv[i], "--check") == 0) check = true;
+        else if (std::strcmp(argv[i], "--buttons") == 0 && i + 1 < argc) buttonsS = std::atof(argv[++i]);
         else {
-            std::printf("example_line.exe [--port COM5] [--check]\n");
+            std::printf("example_line.exe [--port COM5] [--check] [--buttons S]\n");
             return 2;
         }
     }
@@ -38,6 +41,34 @@ int main(int argc, char** argv) {
     if (check) {
         tx.close();
         std::printf("[+] связь и Raw API в порядке\n");
+        return 0;
+    }
+    if (buttonsS > 0.0) {
+        // Кнопки: маску обновляет поток чтения по событиям 0x53. service() в цикле нужен
+        // только для пересинхронизации после переполнения потока (кадр уходит из этого потока).
+        using makcu::MouseButton;
+        const MouseButton all[] = {MouseButton::Left, MouseButton::Right, MouseButton::Middle, MouseButton::Side1,
+            MouseButton::Side2};
+        std::printf(">>> %.0f с: нажимайте кнопки мыши\n", buttonsS);
+        const int64_t t0 = makcu::detail::Qpc::now();
+        uint8_t last = 0xFF;
+        while (makcu::detail::Qpc::toUs(makcu::detail::Qpc::now() - t0) < buttonsS * 1e6) {
+            tx.service();
+            const uint8_t m = tx.buttons();
+            if (m != last) {
+                std::printf("  +%6.3f с  маска %02X ", makcu::detail::Qpc::toUs(makcu::detail::Qpc::now() - t0) / 1e6, m);
+                for (MouseButton b : all) {
+                    if (tx.buttonDown(b)) std::printf(" %s", makcu::buttonName(b));
+                }
+                std::printf("\n");
+                last = m;
+            }
+            Sleep(1);
+        }
+        std::printf("нажатий:");
+        for (MouseButton b : all) std::printf(" %s %u", makcu::buttonName(b), tx.pressCount(b));
+        std::printf("\n%s\n", tx.statsLine().c_str());
+        tx.close();
         return 0;
     }
 

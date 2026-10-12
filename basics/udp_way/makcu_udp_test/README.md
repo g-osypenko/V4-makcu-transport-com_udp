@@ -1,14 +1,15 @@
 # MAKCU UDP path/HID measurement — reproducible bundle
 
-Self-contained copy of the test used to measure the `0x18` path loss over the UDP
-(Ethernet) API. It builds with one `g++` command — the `.cpp` and the three headers are
+Self-contained copy of the tests used to measure movement over the UDP (Ethernet) API:
+the `0x18` path loss, Raw `0x69`, and the `0x6C` batch. Each builds with one `g++` command — the `.cpp` files and the three headers are
 in this folder, no extra include path. Windows only (WinSock + Win32 input APIs).
 
 ## Files
 
 | file | role |
 | --- | --- |
-| `udp_18_closed.cpp` | the test: paced `0x18` ramp, path sent-vs-received, HID rate/intervals |
+| `udp_18_closed.cpp` | paced `0x18` ramp (fixed rate, `0x18` has no reply), path sent-vs-received, HID rate/intervals |
+| `udp_raw_batch.cpp` | closed-loop Raw `0x69`+`0x6A` and `0x6C` batch (receipt → X), same ramp and metrics, receipt fields |
 | `hook_monitor.h` | HID **rate** tool — low-level mouse hook (`WH_MOUSE_LL`) |
 | `rawinput_monitor.h` | **path** tool — Raw Input per-device dx/dy sum |
 | `mover_common.h` | QPC clock + precise pacing + process/thread timing tuning |
@@ -20,11 +21,15 @@ and in `udp_18_closed.cpp`.)
 
 ```
 g++ -std=c++23 -O2 udp_18_closed.cpp -lws2_32 -lwinmm -static -o udp_18_closed.exe
-udp_18_closed.exe --host <board-ip>
+g++ -std=c++23 -O2 udp_raw_batch.cpp -lws2_32 -lwinmm -static -o udp_raw_batch.exe
+udp_18_closed.exe --host <board-ip> --targets 125,200,300,581
+udp_raw_batch.exe --host <board-ip> --mode all      # b) 0x69 at 125/200/300/581, c) 0x6C N=7,16 at 50/100/139 pkt/s
 ```
 MinGW-w64 g++ 13+ (tested on 15.3.0). Options: `--host`, `--port` (8080),
 `--targets 125,150,200,...`, `--speed` (px/ms), `--cell` (s per rate),
-`--quiet-ms`, `--drain-cap-ms`. The cursor moves during the run — don't touch the mouse.
+`--quiet-ms`, `--drain-cap-ms`; `udp_raw_batch` also `--mode raw|batch|all`, `--raw-rates`,
+`--pkt-rates`, `--recs`, `--dt`. The cursor moves during the run — don't touch the mouse (each
+cell parks the cursor at the left edge of the desktop first; it is restored at the end).
 
 ## Test environment (what we ran)
 
@@ -32,7 +37,8 @@ MinGW-w64 g++ 13+ (tested on 15.3.0). Options: `--host`, `--port` (8080),
 - Mouse: **Logitech Lightspeed receiver, VID 046D / PID C547, 1000 Hz** polling, on USB3.
 - Board reachable over UDP at `<board-ip>:8080`, **no encryption**.
 - Topology: PC (onboard Realtek 2.5GbE, gigabit link) → switch → a **UGREEN 60554**
-  hub (USB 3.0 to 3×USB 3.0 + Gigabit 1000M RJ45; Realtek RTL8153-class controller).
+  hub (USB 3.0 to 3×USB 3.0 + Gigabit 1000M RJ45): Genesys Logic hub 05E3:0610 +
+  ASIX AX88179 gigabit NIC 0B95:1790.
   The mouse receiver is in the same UGREEN hub, and that hub is the only device on
   MAKCU's USB3 port.
 
@@ -117,3 +123,37 @@ is exact.
 
 For comparison on the same firmware: Raw `0x69` reply-clocked over UDP ≈ 283 moves/s with
 exact path; Raw `0x69` over COM sustains 997–1001 HID reports/s at 1000 cmd/s, exact.
+
+## Results on V4.097 (same rig, same ramp: 2000 px/s commanded, 2.5 s per row)
+
+`delivered/admitted` = device dx after drain ÷ displacement in records the board accepted.
+`path(drained)` < 1 on the Raw/batch rows is only the carry not yet sent when the window
+closed (4–85 px of ~5000); delivered/admitted is 1.000 on every row.
+
+```
+row                          moves/s  HID Hz  path(live)  path(drained)  intervals 1 ms
+a) 0x18 @125/s (fixed rate)      125     125     0.997       1.000          (8 ms spacing)
+a) 0x18 @200/s                   200     200     0.996       1.000
+a) 0x18 @300/s                   300     300     0.999       1.000
+a) 0x18 @400/s                   267     267     0.666       0.668
+a) 0x18 @500/s                   259     259     0.516       0.518
+a) 0x18 @581/s                   291     291     0.499       0.501
+b) 0x69 @125/s (closed loop)     125     125     0.998       0.998
+b) 0x69 @200/s                   200     200     0.998       0.998
+b) 0x69 @300/s                   284     284     0.998       0.999          (567 datagrams/s)
+b) 0x69 @581/s                   284     284     0.998       0.999
+c) 0x6C N=7  @ 50 pkt/s          350     347     0.988       0.992           86%
+c) 0x6C N=7  @100 pkt/s          700     697     0.993       0.996           86%
+c) 0x6C N=7  @139 pkt/s          974     970     0.995       0.998           97%
+c) 0x6C N=16 @ 50 pkt/s          351     344     0.977       0.983           86%
+c) 0x6C N=16 @100 pkt/s          703     694     0.989       0.996           86%
+c) 0x6C N=16 @139 pkt/s          975     967     0.992       0.995           97%
+```
+
+- `0x18` on V4.097 is one report per command, exact up to 300 cmd/s at a fixed rate;
+  above that only ~260–290 commands/s are accepted (an unanswered `0x18` hand-off ≈ 3.5 ms).
+- Raw `0x69` closed loop: 2 datagrams per move, ~567 datagrams/s → 284 moves/s, exact.
+- `0x6C` N=7: every receipt result 0, 7/7 admitted, free slots 2, freed ≈ 6.9/packet,
+  K ≈ 7, `more` 0 %, no timeouts → **974 moves/s, HID 970 Hz, 97 % 1 ms intervals**.
+- `0x6C` N=16: receipts result 1 (partial), ~7 of 16 admitted, first-failure reason 3 (no
+  space), free slots 0, `more` set → throughput equals N=7 (receipts free at most 7 rows).

@@ -30,7 +30,6 @@
 // via WH_MOUSE_LL hook; path via Raw Input sum of the MAKCU device. Cursor moves.
 //
 // Build: g++ -std=c++23 -O2 udp_18_closed.cpp -lws2_32 -lwinmm -static -o udp_18_closed.exe
-//        (this .cpp and the three headers are in the same folder; no -I needed)
 // Run:   udp_18_closed.exe --host <board-ip> [--port 8080]
 //                          [--targets 125,150,200,300,450,581] [--speed 2]
 //                          [--cell 2.5] [--quiet-ms 400] [--drain-cap-ms 15000]
@@ -223,6 +222,15 @@ std::string hexOf(const std::vector<uint8_t>& v) {
     return s;
 }
 
+// Park the cursor at the left edge of the virtual desktop before a cell, so the +X ramp
+// does not end up pinned at the right edge. SetCursorPos is not mouse input: neither the
+// LL hook nor Raw Input sees it, so it does not touch the measurement.
+void parkCursorLeft() {
+    const int x = GetSystemMetrics(SM_XVIRTUALSCREEN) + 20;
+    const int y = GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) / 2;
+    SetCursorPos(x, y);
+}
+
 // Read the current Raw-Input X sum for the MAKCU device (0 if not seen yet).
 long long pathX(mover::RawInputMonitor& rawin) {
     const auto dev = rawin.primary();
@@ -308,6 +316,8 @@ int main(int argc, char** argv) {
     std::printf(" One 0x18 in flight at a time. Board cycle ~1.72 ms, so any row with\n");
     std::printf(" spacing >= 1.72 ms is CONTENTION-FREE: an admission drop cannot happen.\n\n");
 
+    POINT cursor0{};
+    GetCursorPos(&cursor0);
     mover::HookMonitor hook;
     mover::RawInputMonitor rawin;
     if (!hook.start() || !rawin.start()) { std::printf("monitor start failed\n"); link.close(); return 1; }
@@ -321,6 +331,8 @@ int main(int argc, char** argv) {
         const double spacingMs = 1000.0 / target;
         const uint64_t nSlots = static_cast<uint64_t>(o.cellS * target);
 
+        parkCursorLeft();
+        Sleep(30);
         link.beginCell();
         hook.reset();
         rawin.reset();
@@ -395,6 +407,7 @@ int main(int argc, char** argv) {
     const auto devName = rawin.primary();
     hook.stop();
     rawin.stop();
+    SetCursorPos(cursor0.x, cursor0.y);
 
     // ---- Report table ----
     std::printf("\n");

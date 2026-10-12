@@ -110,3 +110,77 @@ Build line for the probe:
 ```
 g++ -std=c++23 -O2 -I ..\comport_way udp_18_closed.cpp -lws2_32 -lwinmm -static -o udp_18_closed.exe
 ```
+
+---
+
+## 4. Root cause (engineers, 2026-10-11) and the V4.097 matrix (2026-10-12)
+
+**Root cause, verified from source:** the dropped commands never reach the movement
+engine. UDP lands on the networking chip, and each command needs a full hand-off with the
+other chip (request → reply → completion → idle ack) before the next one is accepted; a
+packet arriving during the hand-off is silently dropped. On V4.094 that hand-off averaged
+~7.2 ms under load → ~139 commands/s (our drained totals: `path × cmd/s` = 139.4–140.0).
+COM goes straight to the upstream chip and has no such hand-off (the engineers' COM lab run
+on V4.094: zero loss at 125–1000 cmd/s, report rate ~690–700 Hz). The earlier "1.72 ms busy
+window" was the cost of light query frames, not of a move.
+
+**V4.097** (test build) adds batch `0x6C` (up to 16 Raw moves per packet, one hand-off,
+one receipt) and sends an interpolation-0 move as one report. Engineers' advice: closed loop
+(wait for the reply/receipt), ≤ 7 new records per packet. Probe:
+[`udp_raw_batch.cpp`](udp_raw_batch.cpp); logs `v4097_raw_batch.txt`, `v4097_0x18_extra.txt`.
+
+```
+row                          moves/s  HID Hz  path(live)  path(drained)  intervals 1 ms
+a) 0x18 @125/s (fixed rate)      125     125     0.997       1.000
+a) 0x18 @200/s                   200     200     0.996       1.000
+a) 0x18 @300/s                   300     300     0.999       1.000
+a) 0x18 @400/s                   267     267     0.666       0.668
+a) 0x18 @500/s                   259     259     0.516       0.518
+a) 0x18 @581/s                   291     291     0.499       0.501
+b) 0x69 @125/s (closed loop)     125     125     0.998       0.998
+b) 0x69 @200/s                   200     200     0.998       0.998
+b) 0x69 @300/s                   284     284     0.998       0.999
+b) 0x69 @581/s                   284     284     0.998       0.999
+c) 0x6C N=7  @ 50 pkt/s          350     347     0.988       0.992           86%
+c) 0x6C N=7  @100 pkt/s          700     697     0.993       0.996           86%
+c) 0x6C N=7  @139 pkt/s          974     970     0.995       0.998           97%
+c) 0x6C N=16 @ 50 pkt/s          351     344     0.977       0.983           86%
+c) 0x6C N=16 @100 pkt/s          703     694     0.989       0.996           86%
+c) 0x6C N=16 @139 pkt/s          975     967     0.992       0.995           97%
+```
+
+`path(drained)` < 1 on Raw/batch rows = carry not yet sent at cut-off; delivered ÷ admitted
+= 1.000 on every row. Board ends with 16/16 free records (nothing leaked).
+
+- **~1 kHz over Ethernet works on V4.097:** `0x6C` N=7 @139 pkt/s = 974 moves/s, HID 970 Hz,
+  97 % 1 ms intervals, exact path. Every receipt result 0, 7/7 admitted, free slots 2,
+  freed ≈ 6.9/packet, K ≈ 7, `more` 0 %, no timeouts.
+- N=16 gives the same throughput: ~7 of 16 admitted per packet (result 1, first-failure
+  reason 3 = no space, free slots 0, `more` set), because a receipt frees at most 7 rows.
+- `0x18` (no reply) is exact up to 300 cmd/s at a fixed rate on V4.097; above that only
+  ~260–290/s are accepted (unanswered hand-off ≈ 3.5 ms).
+- Raw `0x69` closed loop is unchanged at ~284 moves/s (2 datagrams per move, ~567/s).
+- External USB-C power on the UGREEN hub changed nothing (checked on V4.094).
+
+**Rig:** PC onboard Realtek 2.5GbE (1 Gbps link) → switch → **UGREEN 60554** (USB 3.0 to
+3×USB 3.0 + gigabit RJ45) on MAKCU USB3, Logitech Lightspeed receiver 046D:C547 @1000 Hz in
+the same hub. Read with the hub plugged into the PC: NIC = **ASIX AX88179, VID:PID 0B95:1790**,
+behind a Genesys Logic hub chip 05E3:0610. (The request doc's "RTL8152" was wrong.)
+
+---
+
+## 5. Engineers' closing answer (2026-10-12)
+
+- **0x18 over UDP tops out around 280 commands/s.** Each UDP command goes to the other chip
+  over an internal link that carries one command at a time; a datagram arriving while the
+  previous one is in flight is dropped. 0x18 has no reply, so the drop is silent. Accepted
+  commands are applied exactly (matches drained path 1.000).
+- **0x6C N=16 partial (reason 3) is expected:** at most 7 rows fit at once, the rest comes back
+  as partial with `more` set.
+- **Intended way above ~280/s:** 0x6C with up to 7 rows per packet, one packet in flight, next
+  one sent on the receipt (what `makcu_udp_mover --tx batch` does), or 0x69 with receipts.
+- A counter or reply for the dropped case is a known gap for later. **Firmware development is
+  paused**, so nothing will change soon.
+
+**Status: closed.** 1 kHz over Ethernet = V4.097 + `0x6C` closed loop. V4.097 is a test build
+and the only one with `0x6C`; the rollback V4.095 does not have it, so stay on V4.097 for UDP.

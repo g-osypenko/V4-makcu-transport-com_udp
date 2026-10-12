@@ -1,0 +1,82 @@
+========================================================================
+ MAKCU  Raw 0x69 / batch 0x6C  closed loop over UDP
+ host 192.168.50.175:8080   speed 2.00 px/ms   cell 2.5 s   ramp +X   dt 0
+ interpolation (0x1F GET): 00
+ board: last_accepted_id 12372, free Raw records 16/16
+========================================================================
+
+ b) Raw 0x69, one record per datagram, closed loop
+  b) 0x69 @ 125/s: 312 moves (125/s), 624 datagrams (250/s), HID 125 Hz, path live 0.998, drained 0.998 (402 ms)
+    acks: submitted 312, rejected 0, still-queued retries 0, other 0 | no-reply 0 (resolved by query) | unsent carry 8 px
+    intervals:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 0%  1.25-1.75 0%  1.75-2.5 (2 кадра) 0%  2.5-5 0%  > 5 мс 100%
+  b) 0x69 @ 200/s: 499 moves (200/s), 998 datagrams (399/s), HID 200 Hz, path live 0.998, drained 0.998 (405 ms)
+    acks: submitted 499, rejected 0, still-queued retries 0, other 0 | no-reply 0 (resolved by query) | unsent carry 10 px
+    intervals:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 0%  1.25-1.75 0%  1.75-2.5 (2 кадра) 0%  2.5-5 49%  > 5 мс 51%
+  b) 0x69 @ 300/s: 710 moves (284/s), 1418 datagrams (567/s), HID 284 Hz, path live 0.998, drained 0.999 (470 ms)
+    acks: submitted 710, rejected 0, still-queued retries 0, other 0 | no-reply 0 (resolved by query) | unsent carry 4 px
+    intervals:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 0%  1.25-1.75 0%  1.75-2.5 (2 кадра) 0%  2.5-5 100%  > 5 мс 0%
+  b) 0x69 @ 581/s: 711 moves (284/s), 1420 datagrams (568/s), HID 284 Hz, path live 0.998, drained 0.999 (459 ms)
+    acks: submitted 711, rejected 0, still-queued retries 0, other 0 | no-reply 0 (resolved by query) | unsent carry 4 px
+    intervals:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 0%  1.25-1.75 0%  1.75-2.5 (2 кадра) 0%  2.5-5 100%  > 5 мс 0%
+
+ c) 0x6C batch, N=7 records per packet, closed loop (receipt -> X)
+  c) 0x6C N=7  @ 50 pkt/s: 125 packets (50/s), 875 records admitted (350 moves/s), HID 347 Hz, path live 0.988, drained 0.992 (446 ms)
+    receipts 125: result 0 (all) 125, 1 (partial) 0, 255 0 | admitted/packet 7.00 of 7 | free slots min 2 avg 2.1
+    freed/packet 6.89 | terminal rows K/packet 6.94 (submitted 868, rejected 0) | 'more' set 0% | queued avg 7.0
+    no receipt 0 | X rejected (255/1) 0 | last_id mismatch 0 | datagrams 125 | unsent carry 40 px
+    first receipt:   01 00 07 07 ff 00 00 09 00 00 07 00 13 39 00 00
+    intervals:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 86%  1.25-1.75 0%  1.75-2.5 (2 кадра) 0%  2.5-5 0%  > 5 мс 14%
+  c) 0x6C N=7  @100 pkt/s: 250 packets (100/s), 1750 records admitted (700 moves/s), HID 697 Hz, path live 0.993, drained 0.996 (459 ms)
+    receipts 250: result 0 (all) 250, 1 (partial) 0, 255 0 | admitted/packet 7.00 of 7 | free slots min 2 avg 2.0
+    freed/packet 6.94 | terminal rows K/packet 6.97 (submitted 1743, rejected 0) | 'more' set 0% | queued avg 7.0
+    no receipt 0 | X rejected (255/1) 0 | last_id mismatch 0 | datagrams 250 | unsent carry 20 px
+    first receipt:   01 00 07 07 ff 00 00 09 00 00 07 00 7e 3c 00 00
+    intervals:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 86%  1.25-1.75 0%  1.75-2.5 (2 кадра) 0%  2.5-5 14%  > 5 мс 0%
+  c) 0x6C N=7  @139 pkt/s: 348 packets (139/s), 2436 records admitted (974 moves/s), HID 970 Hz, path live 0.995, drained 0.998 (483 ms)
+    receipts 348: result 0 (all) 348, 1 (partial) 0, 255 0 | admitted/packet 7.00 of 7 | free slots min 2 avg 2.0
+    freed/packet 6.96 | terminal rows K/packet 6.98 (submitted 2429, rejected 0) | 'more' set 0% | queued avg 7.0
+    no receipt 0 | X rejected (255/1) 0 | last_id mismatch 0 | datagrams 348 | unsent carry 8 px
+    first receipt:   01 00 07 07 ff 00 00 09 00 00 07 00 54 43 00 00
+    intervals:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 97%  1.25-1.75 0%  1.75-2.5 (2 кадра) 3%  2.5-5 0%  > 5 мс 0%
+
+ c) 0x6C batch, N=16 records per packet, closed loop (receipt -> X)
+  c) 0x6C N=16 @ 50 pkt/s: 125 packets (50/s), 877 records admitted (351 moves/s), HID 344 Hz, path live 0.977, drained 0.983 (457 ms)
+    receipts 125: result 0 (all) 1, 1 (partial) 124, 255 0 | admitted/packet 7.02 of 16 | free slots min 0 avg 0.0
+    freed/packet 6.89 | terminal rows K/packet 6.94 (submitted 868, rejected 0) | 'more' set 99% | queued avg 7.0
+    first-failure reason 3: 124 packets
+    no receipt 0 | X rejected (255/1) 0 | last_id mismatch 0 | datagrams 125 | unsent carry 85 px
+    first receipt:   01 00 10 10 ff 00 00 00 00 00 10 00 e1 4c 00 00
+    first partial:   01 01 10 00 00 03 00 00 07 01 00 00 e1 4c 00 00 d2 4c 00 00 02 00 d3 4c 00 00 02 00 d4 4c 00 00 02 00 d5 4c 00 00 02 00 d6 4c 00 00 02 00 d7 4c 00 00 02 00 d8 4c 00 00 02 00
+    intervals:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 86%  1.25-1.75 0%  1.75-2.5 (2 кадра) 0%  2.5-5 0%  > 5 мс 14%
+  c) 0x6C N=16 @100 pkt/s: 251 packets (100/s), 1759 records admitted (703 moves/s), HID 694 Hz, path live 0.989, drained 0.996 (418 ms)
+    receipts 251: result 0 (all) 1, 1 (partial) 250, 255 0 | admitted/packet 7.01 of 16 | free slots min 0 avg 0.0
+    freed/packet 6.94 | terminal rows K/packet 6.97 (submitted 1750, rejected 0) | 'more' set 100% | queued avg 7.0
+    first-failure reason 3: 250 packets
+    no receipt 0 | X rejected (255/1) 0 | last_id mismatch 0 | datagrams 251 | unsent carry 20 px
+    first receipt:   01 00 10 10 ff 00 00 00 00 00 10 00 4e 50 00 00
+    first partial:   01 01 10 00 00 03 00 00 07 01 02 00 4e 50 00 00 3f 50 00 00 02 00 40 50 00 00 02 00 41 50 00 00 02 00 42 50 00 00 02 00 43 50 00 00 02 00 44 50 00 00 02 00 45 50 00 00 02 00
+    intervals:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 86%  1.25-1.75 0%  1.75-2.5 (2 кадра) 0%  2.5-5 14%  > 5 мс 0%
+  c) 0x6C N=16 @139 pkt/s: 348 packets (139/s), 2438 records admitted (975 moves/s), HID 967 Hz, path live 0.992, drained 0.995 (418 ms)
+    receipts 348: result 0 (all) 1, 1 (partial) 347, 255 0 | admitted/packet 7.01 of 16 | free slots min 0 avg 0.0
+    freed/packet 6.96 | terminal rows K/packet 6.98 (submitted 2429, rejected 0) | 'more' set 100% | queued avg 7.0
+    first-failure reason 3: 347 packets
+    no receipt 0 | X rejected (255/1) 0 | last_id mismatch 0 | datagrams 348 | unsent carry 26 px
+    first receipt:   01 00 10 10 ff 00 00 00 00 00 10 00 2d 57 00 00
+    first partial:   01 01 10 00 00 03 00 00 07 01 06 00 2d 57 00 00 1e 57 00 00 02 00 1f 57 00 00 02 00 20 57 00 00 02 00 21 57 00 00 02 00 22 57 00 00 02 00 23 57 00 00 02 00 24 57 00 00 02 00
+    intervals:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 97%  1.25-1.75 0%  1.75-2.5 (2 кадра) 3%  2.5-5 0%  > 5 мс 0%
+
+------------------------------------------------------------------------
+ device for path: VID_046D&PID_C547
+ row                         moves/s  HID Hz  path(live)  path(drained)  drain ms
+ b) 0x69 @ 125/s                 125     125       0.998       0.998           402
+ b) 0x69 @ 200/s                 200     200       0.998       0.998           405
+ b) 0x69 @ 300/s                 284     284       0.998       0.999           470
+ b) 0x69 @ 581/s                 284     284       0.998       0.999           459
+ c) 0x6C N=7  @ 50 pkt/s         350     347       0.988       0.992           446
+ c) 0x6C N=7  @100 pkt/s         700     697       0.993       0.996           459
+ c) 0x6C N=7  @139 pkt/s         974     970       0.995       0.998           483
+ c) 0x6C N=16 @ 50 pkt/s         351     344       0.977       0.983           457
+ c) 0x6C N=16 @100 pkt/s         703     694       0.989       0.996           418
+ c) 0x6C N=16 @139 pkt/s         975     967       0.992       0.995           418
+ board after run: last_accepted_id 24739, free Raw records 16/16
+========================================================================

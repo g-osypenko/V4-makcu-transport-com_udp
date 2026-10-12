@@ -11,7 +11,11 @@
 //     по ответу DEVICE (0x02), DTR/RTS выключены;
 //   - Raw: метаданные 0x6A(id=0), дочистка записей прошлых сессий, окно
 //     живых записей (<= 12 и <= свободно на плате - 2), квитанции, перенос
-//     отказанных дельт, finish() в конце.
+//     отказанных дельт, finish() в конце;
+//   - кнопки мыши: поток INPUT_STREAM mouse (0x52) включается в open(), события
+//     INPUT_CHANGE 0x53 разбирает поток чтения, стартовая маска и пересинхронизация
+//     после переполнения - GET PHYS_BUTTONS 0x55; buttons()/buttonDown()/pressCount().
+//     close() возвращает поток в прежнее состояние.
 // Чего транспорт НЕ делает (это забота вызывающего):
 //   - темп (часы 1 мс), нарезка траектории, квантование/рендерер. Частота HID =
 //     частота ненулевых move(), не выше опроса USB клонированной мыши.
@@ -23,7 +27,10 @@
 //     вызывающий оставляет дельту у себя и добавляет к следующему вызову.
 //     Внутренний перенос (клампинг >32767, отказ платы) транспорт ведёт сам.
 //   - move(0, 0) ничего не отправляет на мышь, только квитанции/перенос (= service()).
-//   - stats()/statsLine() - из любого потока.
+//   - stats()/statsLine(), buttons()/buttonDown()/pressCount() - из любого потока.
+//   - pollButtons() - из потока move() (кадр уходит через то же кольцо записи).
+//
+// Ревизия 2026-10-12 (2): кнопки мыши. Логика Raw-движения не менялась.
 //
 // Происхождение: basics/comport_way/makcu_transport.h (RawComTransport,
 // Format::RawMove, Mode::Async) от 2026-10-10, логика Raw перенесена без
@@ -59,6 +66,8 @@ namespace makcu {
 
 namespace detail {
 
+#ifndef MAKCU_DETAIL_QPC_DEFINED
+#define MAKCU_DETAIL_QPC_DEFINED
 // QPC-часы транспорта (свои, чтобы не зависеть от окружения).
 struct Qpc {
     static int64_t freq() {
@@ -79,6 +88,7 @@ struct Qpc {
     }
     static double toUs(int64_t ticks) { return static_cast<double>(ticks) * 1e6 / static_cast<double>(freq()); }
 };
+#endif  // MAKCU_DETAIL_QPC_DEFINED (общие для COM- и UDP-транспорта)
 
 }  // namespace detail
 
@@ -114,6 +124,26 @@ inline std::vector<std::string> findMakcuPorts() {
     return ports;
 }
 
+#ifndef MAKCU_MOUSE_BUTTONS_DEFINED
+#define MAKCU_MOUSE_BUTTONS_DEFINED
+// Физические кнопки мыши в host-порту MAKCU: номер = бит маски PHYS_BUTTONS (0x55)
+// и id события INPUT_CHANGE (0x53). Общий блок для makcu_raw_transport.h (COM) и
+// makcu_udp_batch_transport.h (UDP): можно подключать оба заголовка.
+enum class MouseButton : uint8_t { Left = 0, Right = 1, Middle = 2, Side1 = 3, Side2 = 4 };
+inline constexpr uint8_t kMouseButtonCount = 5;
+inline constexpr uint8_t buttonBit(MouseButton b) { return static_cast<uint8_t>(1u << static_cast<uint8_t>(b)); }
+inline const char* buttonName(MouseButton b) {
+    switch (b) {
+    case MouseButton::Left: return "left";
+    case MouseButton::Right: return "right";
+    case MouseButton::Middle: return "middle";
+    case MouseButton::Side1: return "side1";
+    case MouseButton::Side2: return "side2";
+    }
+    return "?";
+}
+#endif  // MAKCU_MOUSE_BUTTONS_DEFINED
+
 class RawTransport {
 public:
     // Снимок счётчиков (stats()).
@@ -139,6 +169,13 @@ public:
         uint32_t lastReason = 0;
         int64_t carryX = 0;         // перенос сейчас (должен быть 0 после finish())
         int64_t carryY = 0;
+        // Кнопки
+        uint8_t buttons = 0;          // маска физических кнопок сейчас
+        uint64_t buttonEvents = 0;    // событий 0x53 (мышь)
+        uint64_t buttonOverflows = 0; // переполнений потока (после них - перечитывание 0x55)
+        uint64_t buttonPolls = 0;     // запросов 0x55 (старт, переполнение, pollButtons())
+        uint64_t buttonReplies = 0;   // ответов 0x55
+        uint64_t buttonChanges = 0;   // изменений маски
     };
 
     RawTransport() {
@@ -209,11 +246,19 @@ public:
             close();
             return false;
         }
+        prepareButtons();
         return true;
     }
 
     void close() {
         if (handle_ == INVALID_HANDLE_VALUE) return;
+        if (streamRestore_) {
+            // Вернуть INPUT_STREAM mouse, каким он был до open().
+            const uint8_t set[7] = {0xDE, 0xAD, 0x02, 0x00, kOpInputStream, 0x01, *streamRestore_};
+            (void)writeBlocking(set, sizeof(set));
+            streamRestore_.reset();
+        }
+        buttonsOk_ = false;
         rawMode_ = false;
         stopReader_ = true;
         CancelIoEx(handle_, nullptr);
@@ -236,11 +281,35 @@ public:
     // Строка о сессии Raw: schema, last_accepted_id, свободные записи, дочистка.
     [[nodiscard]] const std::string& info() const { return info_; }
 
+    // ---- кнопки мыши (любой поток, не блокируют) ---------------------------------------
+    // Маска физических кнопок: bit0 левая, bit1 правая, bit2 средняя, bit3 side1, bit4 side2.
+    // Обновляется событиями 0x53 сразу по изменению (поток чтения).
+    [[nodiscard]] uint8_t buttons() const { return mask_.load(std::memory_order_acquire); }
+    [[nodiscard]] bool buttonDown(MouseButton b) const { return (buttons() & buttonBit(b)) != 0; }
+    // Нажатий (переходов 0 -> 1) с open(). Разность двух чтений = нажатия между ними:
+    // клик не теряется, даже если вызывающий читает buttons() редко. Кнопка, зажатая
+    // уже в момент open(), нажатием не считается.
+    [[nodiscard]] uint32_t pressCount(MouseButton b) const {
+        return presses_[static_cast<uint8_t>(b)].load(std::memory_order_acquire);
+    }
+    // false - плата не ответила на 0x55 при open() (прошивка старше V4.036).
+    [[nodiscard]] bool buttonsAvailable() const { return buttonsOk_.load(); }
+    // Перечитать маску (0x55) - из потока move(). Обычно не нужно: события приходят
+    // сами, после переполнения транспорт перечитывает сам. false - кольцо записи занято.
+    bool pollButtons() {
+        if (!healthy()) return false;
+        const uint8_t q[5] = {0xDE, 0xAD, 0x00, 0x00, kOpPhysButtons};
+        if (!sendFrame(q, sizeof(q))) return false;
+        buttonPolls_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
     // ---- горячий путь ---------------------------------------------------------
     // Один целый отчёт. true - принят (уйдёт ровно одним HID-отчётом);
     // false - сейчас нельзя, оставьте дельту у себя до следующего вызова.
     [[nodiscard]] bool move(int16_t dx, int16_t dy) {
         if (!healthy()) return false;
+        resyncButtonsIfNeeded();
         if (dx == 0 && dy == 0) {
             (void)moveRaw(0, 0, true);
             return true;
@@ -250,7 +319,9 @@ public:
 
     // Только квитанции и перенос, без новой дельты (можно звать на пустых тиках).
     void service() {
-        if (healthy()) (void)moveRaw(0, 0, true);
+        if (!healthy()) return;
+        resyncButtonsIfNeeded();
+        (void)moveRaw(0, 0, true);
     }
 
     // Конец движения: квитировать живые записи и дослать перенос (до timeoutMs).
@@ -289,6 +360,12 @@ public:
         s.windowFull = rawStats_.windowFull.load();
         s.maxLive = rawStats_.maxLive.load();
         s.lastReason = rawStats_.lastReason.load();
+        s.buttons = mask_.load();
+        s.buttonEvents = buttonEvents_.load();
+        s.buttonOverflows = buttonOverflows_.load();
+        s.buttonPolls = buttonPolls_.load();
+        s.buttonReplies = buttonReplies_.load();
+        s.buttonChanges = buttonChanges_.load();
         std::lock_guard<std::mutex> lock(rawMutex_);
         s.window = rawWindow_;
         s.carryX = rawCarryX_;
@@ -298,16 +375,18 @@ public:
 
     [[nodiscard]] std::string statsLine() const {
         const Stats s = stats();
-        char buf[512];
+        char buf[768];
         std::snprintf(buf, sizeof(buf),
             "raw 0x69: отправлено %llu | принято в FIFO %llu | отдано в USB-endpoint %llu | отказ %llu"
             " | немедл. ошибок %llu (нет места %llu) | ack %llu, повторов %llu | окно %u, max живых %u"
             " | ждали окно %llu | драйвер занят %llu | перенос (%lld,%lld) | посл. причина %u"
-            " | вызов ср %.1f / max %.1f мкс | ошибок %llu",
+            " | вызов ср %.1f / max %.1f мкс | ошибок %llu"
+            " | кнопки %02X: событий %llu, переполнений %llu, опросов %llu, ответов %llu, изменений %llu",
             u(s.submitted), u(s.accepted), u(s.endpointOk), u(s.rejected), u(s.immediate), u(s.noCapacity),
             u(s.ackSent), u(s.ackRetry), s.window, s.maxLive, u(s.windowFull), u(s.driverBusy),
             static_cast<long long>(s.carryX), static_cast<long long>(s.carryY), s.lastReason, s.avgCallUs,
-            s.maxCallUs, u(s.errors));
+            s.maxCallUs, u(s.errors), s.buttons, u(s.buttonEvents), u(s.buttonOverflows), u(s.buttonPolls),
+            u(s.buttonReplies), u(s.buttonChanges));
         return buf;
     }
 
@@ -321,6 +400,9 @@ private:
     static constexpr uint8_t kOpDevice = 0x02;
     static constexpr uint8_t kOpRawMove = 0x69;
     static constexpr uint8_t kOpRawAck = 0x6A;
+    static constexpr uint8_t kOpInputStream = 0x52;  // GET kind -> enabled; SET kind enabled
+    static constexpr uint8_t kOpInputChange = 0x53;  // событие: kind:u8 id:u8 value:u8 (FF FF - переполнение)
+    static constexpr uint8_t kOpPhysButtons = 0x55;  // V4.036+: GET -> mask:u8 физических кнопок
 
     static unsigned long long u(uint64_t v) { return static_cast<unsigned long long>(v); }
 
@@ -639,6 +721,11 @@ private:
             if ((op == kOpRawMove || op == kOpRawAck) && plen == 6) {
                 const uint8_t* p = &rawRx_[i + 5];
                 onRawReply(op, p[0], p[1], le32(p + 2));
+            } else if (op == kOpInputChange && plen == 3 && rawRx_[i + 5] == 1) {
+                onButtonEvent(rawRx_[i + 6], rawRx_[i + 7]);  // kind 1 = мышь
+            } else if (op == kOpPhysButtons && plen == 1) {
+                buttonReplies_.fetch_add(1, std::memory_order_relaxed);
+                applyMask(rawRx_[i + 5]);
             }
             i += 5 + plen;
         }
@@ -692,6 +779,84 @@ private:
         Sleep(static_cast<DWORD>(wait.count()));
         std::lock_guard<std::mutex> lock(rxMutex_);
         return rx_;
+    }
+
+    // ---- кнопки -----------------------------------------------------------------------------
+    // open(): включить поток событий мыши, запомнить прежнее состояние, прочитать маску.
+    // Порядок важен: поток начинается с "всё отпущено", поэтому маска читается после включения.
+    void prepareButtons() {
+        mask_.store(0, std::memory_order_release);
+        primed_.store(false, std::memory_order_release);
+        buttonResync_.store(false, std::memory_order_release);
+        for (auto& c : presses_) c.store(0, std::memory_order_release);
+        const uint8_t get[6] = {0xDE, 0xAD, 0x01, 0x00, kOpInputStream, 0x01};
+        auto rx = transact(get, sizeof(get), std::chrono::milliseconds(30));
+        std::optional<uint8_t> was;
+        for (size_t i = 0; i + 6 <= rx.size(); ++i) {
+            if (rx[i] == 0xDE && rx[i + 1] == 0xAD && rx[i + 2] == 0x01 && rx[i + 3] == 0x00 &&
+                rx[i + 4] == kOpInputStream) {
+                was = rx[i + 5];
+                break;
+            }
+        }
+        if (!was || *was != 1) {
+            const uint8_t set[7] = {0xDE, 0xAD, 0x02, 0x00, kOpInputStream, 0x01, 0x01};
+            if (writeBlocking(set, sizeof(set))) streamRestore_ = was.value_or(0);
+        }
+        const uint8_t q[5] = {0xDE, 0xAD, 0x00, 0x00, kOpPhysButtons};
+        buttonPolls_.fetch_add(1, std::memory_order_relaxed);
+        rx = transact(q, sizeof(q), std::chrono::milliseconds(30));
+        for (size_t i = 0; i + 6 <= rx.size(); ++i) {
+            if (rx[i] == 0xDE && rx[i + 1] == 0xAD && rx[i + 2] == 0x01 && rx[i + 3] == 0x00 &&
+                rx[i + 4] == kOpPhysButtons) {
+                // Стартовая маска - не нажатия (поток чтения мог применить тот же ответ раньше).
+                mask_.store(rx[i + 5], std::memory_order_release);
+                primed_.store(true, std::memory_order_release);
+                buttonsOk_ = true;
+                break;
+            }
+        }
+        if (buttonsOk_) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "; кнопки: маска %02X, поток событий %s", mask_.load(),
+                streamRestore_ ? "включён" : "уже был включён");
+            info_ += buf;
+        } else {
+            info_ += "; кнопки: 0x55 не ответил (нужна V4.036+)";
+        }
+    }
+
+    // Поток чтения: событие кнопки мыши. FF FF - события потеряны, нужна маска заново.
+    void onButtonEvent(uint8_t id, uint8_t value) {
+        if (id == 0xFF && value == 0xFF) {
+            buttonOverflows_.fetch_add(1, std::memory_order_relaxed);
+            buttonResync_.store(true, std::memory_order_release);
+            return;
+        }
+        if (id >= 8 || value > 1) return;  // не кнопка (например, колесо 0x20 в тест-сборках)
+        buttonEvents_.fetch_add(1, std::memory_order_relaxed);
+        const uint8_t bit = static_cast<uint8_t>(1u << id);
+        const uint8_t old = mask_.load(std::memory_order_acquire);
+        applyMask(value ? static_cast<uint8_t>(old | bit) : static_cast<uint8_t>(old & ~bit));
+    }
+
+    // Поток чтения: новая маска; переходы 0 -> 1 считаются нажатиями (после стартовой маски).
+    void applyMask(uint8_t mask) {
+        const uint8_t old = mask_.exchange(mask, std::memory_order_acq_rel);
+        if (!primed_.exchange(true, std::memory_order_acq_rel)) return;  // первая маска - не нажатия
+        if (old == mask) return;
+        buttonChanges_.fetch_add(1, std::memory_order_relaxed);
+        const uint8_t pressed = static_cast<uint8_t>(mask & ~old);
+        for (uint8_t i = 0; i < kMouseButtonCount; ++i) {
+            if (pressed & (1u << i)) presses_[i].fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+
+    // Поток move(): после переполнения потока перечитать маску.
+    void resyncButtonsIfNeeded() {
+        if (buttonResync_.exchange(false, std::memory_order_acq_rel) && !pollButtons()) {
+            buttonResync_.store(true, std::memory_order_release);  // кольцо занято - на следующем тике
+        }
     }
 
     bool configure(uint32_t baud) {
@@ -847,6 +1012,15 @@ private:
     std::vector<uint8_t> rawRx_;  // только поток чтения (и prepareRaw под rawRxMutex_)
     std::atomic<bool> rawMode_{false};
     RawStats rawStats_;
+
+    // Кнопки: маску пишет поток чтения (и open()), читают все.
+    std::atomic<bool> buttonsOk_{false};
+    std::atomic<bool> primed_{false};        // стартовая маска получена
+    std::atomic<bool> buttonResync_{false};  // переполнение: перечитать 0x55
+    std::optional<uint8_t> streamRestore_;   // INPUT_STREAM mouse до open(), если меняли
+    std::atomic<uint8_t> mask_{0};
+    std::array<std::atomic<uint32_t>, kMouseButtonCount> presses_{};
+    std::atomic<uint64_t> buttonEvents_{0}, buttonOverflows_{0}, buttonPolls_{0}, buttonReplies_{0}, buttonChanges_{0};
 };
 
 }  // namespace makcu

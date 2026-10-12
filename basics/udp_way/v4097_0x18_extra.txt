@@ -1,0 +1,38 @@
+========================================================================
+ MAKCU  0x18 MOVE  closed-loop / contention-free sweep over UDP
+ host 192.168.50.175:8080   speed 2.00 px/ms   cell 2.5 s   ramp +X
+ interpolation (0x1F GET): 00
+ board: last_accepted_id 24739, free Raw records 16/16
+------------------------------------------------------------------------
+ 0x18 UDP reply: 0/20 frames replied  =>  0x18 is FIRE-AND-FORGET (no reply; paced one-in-flight by spacing)
+------------------------------------------------------------------------
+ One 0x18 in flight at a time. Board cycle ~1.72 ms, so any row with
+ spacing >= 1.72 ms is CONTENTION-FREE: an admission drop cannot happen.
+
+   400 c/s done: sent 999 x 0x18, HID 267 Hz, path live 0.666, drained 0.668 (417 ms)
+   500 c/s done: sent 1249 x 0x18, HID 259 Hz, path live 0.516, drained 0.518 (418 ms)
+   550 c/s done: sent 1374 x 0x18, HID 279 Hz, path live 0.503, drained 0.504 (418 ms)
+
+ device for path: VID_046D&PID_C547
+ target  spacing  sent    cmd/s   admit   HID Hz  rep/cmd  path    drain    path
+  c/s     (ms)    0x18            %(adm)  (live)  (final)  (live)  (ms)     (drained)
+ ------  -------  ------  ------  ------  ------  -------  ------  -------  ---------
+   400     2.50     999     400     n/a     267     0.67   0.666      417  0.668
+   500     2.00    1249     500     n/a     259     0.52   0.516      418  0.518
+   550     1.82    1374     550     n/a     279     0.51   0.503      418  0.504
+   ( ! = spacing < 1.72 ms: busy-window contention is possible on this row )
+
+ interval histogram (LL hook), % per bucket:
+   400 c/s:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 0%  1.25-1.75 0%  1.75-2.5 (2 кадра) 0%  2.5-5 88%  > 5 мс 12%
+   500 c/s:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 0%  1.25-1.75 0%  1.75-2.5 (2 кадра) 0%  2.5-5 93%  > 5 мс 7%
+   550 c/s:  < 0.75 мс 0%  0.75-1.25 (1 кадр) 0%  1.25-1.75 0%  1.75-2.5 (2 кадра) 0%  2.5-5 100%  > 5 мс 0%
+
+ Reading:
+  path(live)    = movement during the send window / movement sent
+  path(drained) = total movement after the output backlog drained / sent
+     == 1.000  -> steps only DELAYED, interp carried them   [engineers right]
+     <  1.000  -> steps LOST                                 [our hypothesis]
+  A contention-free row (no !) that still loses path = the loss is output-bound
+  (~4 reports/cmd * cmd/s > ~556 reports/s), not a busy-window admission drop.
+  Reference (bench): Raw 0x69 reply-clocked over UDP = ~283 moves/s, path exact.
+========================================================================
