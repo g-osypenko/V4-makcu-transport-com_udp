@@ -8,7 +8,8 @@
 риски — в [SOLUTION_1000HZ_RAW_MOVE.md](SOLUTION_1000HZ_RAW_MOVE.md).
 
 Этот README — главный документ папки и точка входа для следующей сессии.
-`HANDOFF_PROMPT.md` — история, описывает состояние **до** решения.
+Эталонный транспорт для встраивания в свои программы (движение + кнопки мыши):
+[`perfect-transport-comport/`](perfect-transport-comport/README.md).
 
 ---
 
@@ -82,8 +83,9 @@
 | `rawinput_monitor.h` | сверка пути по Raw Input (суммы дельт; частоту не меряет - фон прореживается до ~125 Гц) |
 | `build.bat` | сборка: MinGW g++ C++23 + статическая `libmakxd-cpp.a` + ABCurves C99 |
 
-Всё остальное в `basics\` (Python-скрипты, `makcu_*1000hz*.cpp`, `makcu_driver_cpp.cpp`,
-UDP-клиенты) и корневые `*.md` - эксперименты прошлых сессий, **не эталон**.
+Ранние эксперименты из корня `basics\` (Python-скрипты, `makcu_*1000hz*.cpp`, `makcu_driver_cpp.cpp`,
+UDP-клиенты, корневые `*.md`) и передаточные записки `HANDOFF_PROMPT.md` удалены 2026-10-12.
+Они остались в истории git (до коммита c579fd6 включительно).
 
 ### Эталонные параметры
 
