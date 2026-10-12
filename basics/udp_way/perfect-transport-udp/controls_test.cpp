@@ -9,6 +9,9 @@
 //                      столько же нажатий и отпусканий; задержка press() -> событие в Windows.
 //     --locks S        S секунд заблокированы side1, side2, middle: жмите их - транспорт видит
 //                      физику, Windows - нет. Потом всё снимается.
+//     --axes S         блокировка осей: 5 фаз по S секунд (ось X, ось Y, только +X, только -Y,
+//                      ничего). Водите мышью во все стороны: Windows не должен получить ни одного
+//                      отсчёта в заблокированном направлении.
 //     --reconnect S    S секунд движения по кругу + блокировка side2; выдерните сетевой кабель
 //                      на 3-5 с и вставьте обратно: обрыв, переподключение, блокировка на месте.
 //     --draw S         наглядно: S секунд - зажать левую, провести круг (в окне рисуется
@@ -54,8 +57,10 @@ struct Ui {
     std::array<std::atomic<uint32_t>, 5> down{}, up{};
     std::array<std::atomic<int64_t>, 5> lastDownT{};
     std::atomic<int64_t> rawX{0}, rawY{0};
+    std::atomic<int64_t> xPos{0}, xNeg{0}, yPos{0}, yNeg{0};  // путь по знаку, модуль (--axes)
 };
 Ui g_ui;
+std::atomic<const wchar_t*> g_hint{nullptr};  // подсказка фазы теста (красным в окне)
 HHOOK g_hook = nullptr;
 makcu::UdpBatchTransport* g_tx = nullptr;  // для статуса в окне
 
@@ -104,8 +109,11 @@ void drawStatus(HDC dc, HWND h) {
         g_ui.down[0].load(), g_ui.down[1].load(), g_ui.down[2].load(), g_ui.down[3].load(), g_ui.down[4].load(),
         static_cast<unsigned long long>(g_ui.moves.load()));
     TextOutW(dc, 8, 26, line, static_cast<int>(wcslen(line)));
-    const wchar_t* legend = L"след левой - чёрный, точки: R красная, M синяя, S1 зелёная, S2 оранжевая";
+    const wchar_t* hint = g_hint.load();
+    const wchar_t* legend = hint ? hint : L"след левой - чёрный, точки: R красная, M синяя, S1 зелёная, S2 оранжевая";
+    const COLORREF oldColor = SetTextColor(dc, hint ? RGB(200, 0, 0) : GetSysColor(COLOR_WINDOWTEXT));
     TextOutW(dc, 8, 46, legend, static_cast<int>(wcslen(legend)));
+    SetTextColor(dc, oldColor);
 }
 
 int buttonFromMsg(WPARAM wp, const MSLLHOOKSTRUCT* info, bool& isDown) {
@@ -163,6 +171,11 @@ LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             raw.header.dwType == RIM_TYPEMOUSE && !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
             g_ui.rawX.fetch_add(raw.data.mouse.lLastX);
             g_ui.rawY.fetch_add(raw.data.mouse.lLastY);
+            const LONG dx = raw.data.mouse.lLastX, dy = raw.data.mouse.lLastY;
+            if (dx > 0) g_ui.xPos.fetch_add(dx);
+            if (dx < 0) g_ui.xNeg.fetch_add(-dx);
+            if (dy > 0) g_ui.yPos.fetch_add(dy);
+            if (dy < 0) g_ui.yNeg.fetch_add(-dy);
         }
         return DefWindowProcW(h, m, wp, lp);
     }
@@ -395,6 +408,73 @@ bool runLocks(makcu::UdpBatchTransport& tx, double seconds) {
     return ok;
 }
 
+// Блокировка осей: по фазе на цель, пользователь водит мышью во все стороны. Raw Input считает
+// физическое движение, дошедшее до Windows, отдельно по знаку: у заблокированного направления 0.
+bool runAxes(makcu::UdpBatchTransport& tx, double seconds) {
+    struct Phase {
+        const char* name;
+        const wchar_t* hint;
+        int target;   // -1 - ничего не заблокировано
+        int blocked;  // 0 ось X, 1 ось Y, 2 только +X, 3 только -Y, -1 нет
+    };
+    const Phase phases[] = {
+        {"ось X", L"ЗАБЛОКИРОВАНА ОСЬ X: водите мышью во все стороны - курсор только вверх-вниз",
+            static_cast<int>(LockTarget::X), 0},
+        {"ось Y", L"ЗАБЛОКИРОВАНА ОСЬ Y: водите мышью во все стороны - курсор только влево-вправо",
+            static_cast<int>(LockTarget::Y), 1},
+        {"+X (вправо)", L"ЗАБЛОКИРОВАНО ВПРАВО (+X): водите во все стороны - вправо курсор не идёт",
+            static_cast<int>(LockTarget::XPos), 2},
+        {"-Y (вверх)", L"ЗАБЛОКИРОВАНО ВВЕРХ (-Y): водите во все стороны - вверх курсор не идёт",
+            static_cast<int>(LockTarget::YNeg), 3},
+        {"ничего", L"ВСЁ СНЯТО: водите мышью - курсор ходит во все стороны", -1, -1},
+    };
+    std::printf(">>> блокировка осей: 5 фаз по %.0f с. В каждой водите мышью во все стороны (подсказка в окне)\n", seconds);
+    std::printf("  фаза          | плата  | вправо  влево  вниз  вверх (отсчёты в Windows) | итог\n");
+    bool ok = true;
+    for (const Phase& ph : phases) {
+        if (g_stop.load()) break;
+        tx.unlockAll();
+        if (ph.target >= 0) tx.setLock(static_cast<LockTarget>(ph.target), true);
+        g_hint = ph.hint;
+        Sleep(300);  // команда дошла, сверена снимком; рука успевает понять фазу
+        const int64_t xp0 = g_ui.xPos.load(), xn0 = g_ui.xNeg.load(), yp0 = g_ui.yPos.load(), yn0 = g_ui.yNeg.load();
+        const int64_t until = Q::now() + Q::fromUs(seconds * 1e6);
+        while (Q::now() < until && !g_stop.load()) {
+            checkEsc();
+            tx.service();
+            Sleep(5);
+        }
+        const int64_t xp = g_ui.xPos.load() - xp0, xn = g_ui.xNeg.load() - xn0;
+        const int64_t yp = g_ui.yPos.load() - yp0, yn = g_ui.yNeg.load() - yn0;
+        const int64_t kMoved = 50;  // столько отсчётов - "двигали"
+        bool blockedOk = true, movedOk = true;
+        switch (ph.blocked) {
+        case 0: blockedOk = xp == 0 && xn == 0; movedOk = yp > kMoved && yn > kMoved; break;
+        case 1: blockedOk = yp == 0 && yn == 0; movedOk = xp > kMoved && xn > kMoved; break;
+        case 2: blockedOk = xp == 0; movedOk = xn > kMoved; break;
+        case 3: blockedOk = yn == 0; movedOk = yp > kMoved; break;
+        default: movedOk = xp > kMoved && xn > kMoved && yp > kMoved && yn > kMoved; break;
+        }
+        const char* verdict = !blockedOk ? "<-- ПРОШЛО ЧЕРЕЗ БЛОКИРОВКУ"
+                              : !movedOk ? "? мало движения - не проверено"
+                              : ph.blocked < 0 ? "OK: всё проходит" : "OK: заблокировано";
+        if (!blockedOk || !movedOk) ok = false;
+        std::string name = ph.name;  // дополнить пробелами по символам, а не байтам (UTF-8)
+        size_t chars = 0;
+        for (const unsigned char c : name) chars += (c & 0xC0) != 0x80;
+        name.append(chars < 13 ? 13 - chars : 0, ' ');
+        std::printf("  %s | %04X  | %6lld %6lld %6lld %6lld | %s\n", name.c_str(), tx.locksOnBoard(),
+            static_cast<long long>(xp), static_cast<long long>(xn), static_cast<long long>(yp), static_cast<long long>(yn),
+            verdict);
+        std::fflush(stdout);
+    }
+    g_hint = nullptr;
+    tx.unlockAll();
+    Sleep(50);
+    std::printf("  блокировки сняты: на плате %04X\n", tx.locksOnBoard());
+    return ok;
+}
+
 bool runReconnect(makcu::UdpBatchTransport& tx, double seconds) {
     tx.setLock(LockTarget::Side2, true);
     std::printf(">>> переподключение: %.0f с движения по кругу, side2 заблокирована.\n"
@@ -616,7 +696,7 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--host" && i + 1 < argc) host = argv[++i];
         else if (a == "--clicks") mode = a;
-        else if ((a == "--locks" || a == "--reconnect" || a == "--soak" || a == "--draw" || a == "--watch") && i + 1 < argc) {
+        else if ((a == "--locks" || a == "--axes" || a == "--reconnect" || a == "--soak" || a == "--draw" || a == "--watch") && i + 1 < argc) {
             mode = a;
             arg = std::atof(argv[++i]);
         } else {
@@ -625,7 +705,7 @@ int main(int argc, char** argv) {
         }
     }
     if (mode.empty()) {
-        std::printf("controls_test.exe [--host IP] --clicks | --draw S | --watch S | --locks S | --reconnect S | --soak MINUTES\n");
+        std::printf("controls_test.exe [--host IP] --clicks | --draw S | --watch S | --locks S | --axes S | --reconnect S | --soak MINUTES\n");
         return 2;
     }
     makcu::UdpBatchTransport tx;
@@ -645,6 +725,7 @@ int main(int argc, char** argv) {
     bool ok = false;
     if (mode == "--clicks") ok = runClicks(tx);
     else if (mode == "--locks") ok = runLocks(tx, arg);
+    else if (mode == "--axes") ok = runAxes(tx, arg);
     else if (mode == "--reconnect") ok = runReconnect(tx, arg);
     else if (mode == "--soak") ok = runSoak(tx, static_cast<int>(arg));
     else if (mode == "--draw") ok = runDraw(tx, arg);
