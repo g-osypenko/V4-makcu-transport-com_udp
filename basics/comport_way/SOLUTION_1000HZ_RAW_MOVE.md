@@ -437,9 +437,10 @@ makcu_mover.exe --tx async ...                         # старый путь �
   переписать по этому файлу.
 - **`motion_engine.h`**, комментарий в начале: «частоту выхода инжекта задаёт
   прошивка». Это верно только для `0x18` / `km.move`.
-- Корневые `CONTEXT_AND_SETUP.md`, `POLLING_RATE_AND_QUEUE_DEEP_DIVE.md`,
-  `STATE_AND_FREQUENCY_ANALYSIS.md`, `basics\0*.md`: гипотезы прошлых сессий,
-  Raw API там не упоминается.
+- `legacy-python-exp/POLLING_RATE_AND_QUEUE_DEEP_DIVE.md` и
+  `legacy-python-exp/STATE_AND_FREQUENCY_ANALYSIS.md` (до 2026-10-12 лежали в корне):
+  гипотезы прошлых сессий, Raw API там не упоминается. Корневой `CONTEXT_AND_SETUP.md`
+  переписан 2026-10-12 и актуален.
 
 ## 12. Источники
 
