@@ -182,5 +182,6 @@ behind a Genesys Logic hub chip 05E3:0610. (The request doc's "RTL8152" was wron
 - A counter or reply for the dropped case is a known gap for later. **Firmware development is
   paused**, so nothing will change soon.
 
-**Status: closed.** 1 kHz over Ethernet = V4.097 + `0x6C` closed loop. V4.097 is a test build
-and the only one with `0x6C`; the rollback V4.095 does not have it, so stay on V4.097 for UDP.
+**Status: closed.** 1 kHz over Ethernet = V4.097 + `0x6C` closed loop. Update 2026-10-12: V4.097
+became the **official** MAKCU firmware on 2026-10-11 (MCP `firmware_versions`: `current_official`),
+so `0x6C` is no longer test-only. V4.095 and older lack it.

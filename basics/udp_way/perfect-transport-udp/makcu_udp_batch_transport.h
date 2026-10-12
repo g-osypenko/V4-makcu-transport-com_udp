@@ -1,53 +1,67 @@
 // MAKCU UDP batch transport (Ethernet, 0x6C) - замороженная эталонная версия.
 //
 // Один заголовок, без зависимостей кроме WinAPI (Winsock 2). Доставляет целые
-// отчёты (dx, dy) в MAKCU по UDP командой batch 0x6C (тест-сборка V4.097):
-// до 7 Raw-записей в одной датаграмме, одна квитанция на пакет. Каждый
-// принятый move() = ровно одна запись = ровно один HID-отчёт, мимо интерполятора.
+// отчёты (dx, dy) в MAKCU по UDP командой batch 0x6C (V4.097+): до 7 Raw-записей в
+// одной датаграмме, одна квитанция на пакет. Каждый принятый move() = ровно одна
+// запись = ровно один HID-отчёт, мимо интерполятора.
 //
 // Что транспорт делает:
-//   - свой UDP-сокет (обёртка RAW: 0x55 + nonce u64 + кадр MAK_API), поток приёма;
+//   - свой UDP-сокет (обёртка RAW: 0x55 + nonce u64 + кадр MAK_API), поток приёма и
+//     сторожевой поток;
 //   - открытие: DEVICE 0x02 (маршрут мыши), FIRMWARE 0x04 (>= 4097), Raw-метаданные
-//     0x6A(id=0), дочистка записей прошлых сессий;
-//   - closed loop: в полёте один пакет; поток приёма по квитанции сразу шлёт
-//     следующий с накопившимися записями (<= 7), X = старший терминальный id из
+//     0x6A(id=0), дочистка записей прошлых сессий, поток событий кнопок, сброс
+//     инжектированных кнопок и блокировок (после упавшей программы);
+//   - closed loop: в полёте одна команда; поток приёма по квитанции сразу шлёт
+//     следующий пакет с накопившимися записями (<= 7), X = старший терминальный id из
 //     квитанций (flags bit0) освобождает записи платы;
 //   - непринятые платой записи (нет места) возвращаются в начало очереди;
 //     нет квитанции 30 мс - опрос 0x6A(id=0): last_accepted_id показывает, что принято;
 //   - finish(): дослать очередь, дождаться квитанции, освободить хвост записей;
-//   - кнопки мыши: open() включает поток INPUT_STREAM mouse (0x52), события
-//     INPUT_CHANGE 0x53 приходят сразу по нажатию; стартовая маска и страховочный
-//     опрос (раз в 50 мс) - GET PHYS_BUTTONS 0x55 в том же замкнутом цикле. Если опрос
-//     находит изменения, которых не принесли события (их режет брандмауэр?), опрос
-//     сам учащается до 5 мс. close() возвращает поток. buttons()/buttonDown()/pressCount().
-//     ВАЖНО: события плата шлёт на наш порт, но С ПОРТА, РАВНОГО НАШЕМУ, а не с 8080,
-//     поэтому сокет без connect(): принимаются любые датаграммы с IP платы.
+//   - чтение кнопок мыши: поток INPUT_STREAM mouse (0x52), события INPUT_CHANGE 0x53
+//     сразу по нажатию; стартовая маска и страховочный опрос (раз в 50 мс) - GET
+//     PHYS_BUTTONS 0x55. Если опрос находит изменения, которых не принесли события
+//     (их режет брандмауэр?), опрос сам учащается до 5 мс. buttons()/buttonDown()/
+//     pressCount(). ВАЖНО: события плата шлёт на наш порт С ПОРТА, РАВНОГО НАШЕМУ,
+//     а не с 8080, поэтому сокет без connect();
+//   - инжект кнопок: press()/release() - SET 0x11..0x15, первым в цикле (раньше
+//     движения), без тайминга и "хуманизации" (время нажатия задаёт вызывающий);
+//   - блокировки физического ввода: setLock() - SET LOCK 0x60, 14 целей (кнопки, оси,
+//     направления, колесо). Блокировка действует только на физическую мышь: инжект её
+//     обходит, а чтение кнопок (0x53/0x55) видит физику до блокировки;
+//   - команды без ответа (кнопки, блокировки) проверяются снимком GET INJECT_SNAPSHOT
+//     0x56: что не применилось (потерялась датаграмма, перезагрузилась плата),
+//     отправляется заново. Снимок же - пульс связи (раз в 250 мс);
+//   - связь пропала (плата молчит 750 мс): move() == false, сторожевой поток
+//     переподключается и восстанавливает поток событий, блокировки и зажатые кнопки;
+//     записи движения, не дошедшие до платы, сбрасываются (устарели);
+//   - close(): отпустить все инжектированные кнопки, снять все блокировки, вернуть поток
+//     событий в прежнее состояние.
 // Чего транспорт НЕ делает (это забота вызывающего):
-//   - темп (часы 1 мс), нарезка траектории, квантование/рендерер. Частота HID =
-//     частота ненулевых принятых move(), не выше опроса USB клонированной мыши.
+//   - темп (часы 1 мс), нарезка траектории, квантование/рендерер, время удержания
+//     кнопок. Частота HID = частота ненулевых принятых move(), не выше опроса USB
+//     клонированной мыши.
 //
 // Почему так (замеры 2026-10-11/12, подробно - README.md):
 //   - каждая UDP-команда идёт на второй чип MAKCU по внутреннему каналу, который
 //     везёт одну команду за раз; датаграмма, пришедшая во время передачи, молча
 //     выбрасывается. Поэтому одна команда в полёте и много записей в одной команде;
-//   - квитанция сообщает не больше 7 терминальных строк, поэтому пакет <= 7 записей
-//     (16 дают ту же скорость: лишние возвращаются с reason 3 "нет места").
+//     после команды без ответа - пауза 2 мс (замер: со 1-1.5 мс следующая проходит);
+//   - квитанция сообщает не больше 7 терминальных строк, поэтому пакет <= 7 записей.
 //
 // Контракт вызова:
 //   - move()/service()/finish() - из ОДНОГО потока (обычно поток тайминга).
 //     Никогда не блокируются на сети (finish() - до timeoutMs).
-//   - move() == false: очередь полна (7 записей ждут пакета) или транспорт
-//     неисправен - вызывающий оставляет дельту у себя и добавляет к следующему вызову.
+//   - move() == false: очередь полна (7 записей ждут пакета) или связи нет - вызывающий
+//     оставляет дельту у себя (после долгого обрыва, возможно, лучше её сбросить).
 //   - move(0, 0) ничего не отправляет на мышь (= service()).
-//   - stats()/statsLine(), buttons()/buttonDown()/pressCount() - из любого потока.
+//   - press()/release()/setLock()/... , buttons()/..., stats()/statsLine() - из любого потока.
 //
-// Ревизия 2026-10-12 (2): кнопки мыши. Логика движения не менялась.
+// Ревизия 2026-10-12 (2): чтение кнопок мыши. Ревизия 2026-10-12 (3): инжект кнопок,
+// блокировки, переподключение, сброс состояния при open()/close(). Логика движения
+// не менялась.
 //
 // Происхождение: basics/udp_way/makcu_udp_transport.h (RawUdpTransport,
-// Format::Batch) от 2026-10-12. Отличия: только batch 0x6C (без 0x69/0x18/0x67,
-// ведра и проб), переполнение очереди - move() == false вместо склейки записей,
-// ответы сопоставляются по nonce без кольца отправленных. Не править: новая
-// версия - новая папка.
+// Format::Batch) от 2026-10-12. Не править: новая версия - новая папка.
 #pragma once
 
 #ifndef _WIN32_WINNT
@@ -145,17 +159,43 @@ inline const char* buttonName(MouseButton b) {
 }
 #endif  // MAKCU_MOUSE_BUTTONS_DEFINED
 
+#ifndef MAKCU_LOCK_TARGET_DEFINED
+#define MAKCU_LOCK_TARGET_DEFINED
+// Цели блокировки физического ввода (SET/GET LOCK 0x60; бит в маске = номер цели).
+// Ось целиком (X, Y, Wheel) = оба направления: плата хранит по оси два бита (+ и -),
+// бит всей оси выставлен, когда заблокированы оба. Снять "+X" - значит снять и "X".
+enum class LockTarget : uint8_t {
+    Left = 0, Right = 1, Middle = 2, Side1 = 3, Side2 = 4,
+    X = 5, XPos = 6, XNeg = 7,
+    Y = 8, YPos = 9, YNeg = 10,
+    Wheel = 11, WheelUp = 12, WheelDown = 13,
+};
+inline constexpr uint8_t kLockTargetCount = 14;
+inline constexpr uint16_t lockBit(LockTarget t) { return static_cast<uint16_t>(1u << static_cast<uint8_t>(t)); }
+inline const char* lockName(LockTarget t) {
+    static const char* const kNames[kLockTargetCount] = {"left", "right", "middle", "side1", "side2", "X", "+X", "-X",
+        "Y", "+Y", "-Y", "wheel", "wheel+", "wheel-"};
+    const auto i = static_cast<uint8_t>(t);
+    return i < kLockTargetCount ? kNames[i] : "?";
+}
+#endif  // MAKCU_LOCK_TARGET_DEFINED
+
 class UdpBatchTransport {
 public:
     static constexpr uint16_t kDefaultPort = 8080;
-    static constexpr uint32_t kMinFirmware = 4097;  // первая сборка с 0x6C (тест-сборка V4.097)
+    static constexpr uint32_t kMinFirmware = 4097;  // первая сборка с 0x6C
     static constexpr size_t kMaxRecords = 7;        // записей в пакете: квитанция освобождает <= 7 строк
     static constexpr size_t kMaxPending = 7;        // очередь move(); полна - move() == false
     static constexpr double kLostUs = 30000.0;      // нет квитанции 30 мс - спросить last_accepted_id
     static constexpr double kDefaultButtonPollMs = 50.0;  // страховочный опрос 0x55 (0 - выключить)
     static constexpr double kFallbackPollMs = 5.0;        // опрос, если события 0x53 не доходят
     static constexpr uint32_t kMissedForFallback = 2;     // изменений, найденных только опросом
-    static constexpr double kPollLostUs = 10000.0;        // нет ответа на опрос 10 мс - считать потерянным
+    static constexpr double kPollLostUs = 10000.0;        // нет ответа на опрос/снимок 10 мс - потерян
+    static constexpr double kNoReplyGapUs = 2000.0;       // пауза после команды без ответа
+    static constexpr double kHeartbeatUs = 250000.0;      // снимок 0x56: сверка кнопок/блокировок + пульс
+    static constexpr double kStreamCheckUs = 5000000.0;   // проверка, что поток событий включён
+    static constexpr double kLinkLostUs = 750000.0;       // плата молчит столько - связь потеряна
+    static constexpr double kReconnectRetryUs = 250000.0; // попытки переподключения
 
     // Снимок счётчиков (stats()).
     struct Stats {
@@ -175,7 +215,7 @@ public:
         uint64_t termRejected = 0;   // терминальных строк: отказ
         uint64_t moreSet = 0;        // квитанций с флагом more
         uint64_t busy = 0;           // move() == false из-за полной очереди
-        uint64_t sendErrors = 0;     // send() не прошёл (занят буфер или ошибка)
+        uint64_t sendErrors = 0;     // send() не прошёл (занят буфер или нет сети)
         uint64_t datagrams = 0;      // всех датаграмм, включая служебные
         uint32_t minFree = 256;      // минимум свободных записей платы по квитанциям (256 - квитанций не было)
         uint32_t maxPending = 0;     // максимум записей в очереди
@@ -184,7 +224,7 @@ public:
         uint32_t lastReason = 0;     // последняя причина отказа из квитанции
         double rttAvgMs = 0.0;       // квитанция: средняя и максимальная задержка
         double rttMaxMs = 0.0;
-        // Кнопки
+        // Чтение кнопок
         uint8_t buttons = 0;           // маска физических кнопок сейчас
         uint64_t buttonEvents = 0;     // событий 0x53 (мышь)
         uint64_t buttonOverflows = 0;  // переполнений потока событий (после них - опрос сразу)
@@ -194,6 +234,23 @@ public:
         uint64_t buttonMissed = 0;     // изменений, которые нашёл опрос, а не событие
         uint64_t buttonChanges = 0;    // изменений маски
         bool eventsMissing = false;    // событий нет, а опрос видит нажатия: опрос учащён до 5 мс
+        // Инжект кнопок и блокировки
+        uint8_t injectWanted = 0;      // инжектированные кнопки: запрошено
+        uint8_t injectOnBoard = 0;     //   по последнему снимку платы
+        uint16_t locksWanted = 0;      // блокировки: запрошено
+        uint16_t locksOnBoard = 0;     //   по последнему снимку платы
+        uint64_t buttonCommands = 0;   // отправлено SET 0x11..0x15
+        uint64_t lockCommands = 0;     // отправлено SET 0x60
+        uint64_t snapshots = 0;        // снимков 0x56
+        uint64_t snapshotLost = 0;     // снимков без ответа
+        uint64_t repairs = 0;          // снимок разошёлся с отправленным - команды повторены
+        uint64_t streamRestores = 0;   // поток событий оказался выключен - включён снова
+        // Связь
+        bool connected = false;
+        uint64_t linkLost = 0;         // сколько раз связь терялась
+        uint64_t reconnects = 0;       // сколько раз восстановлена
+        double lastOutageMs = 0.0;     // длительность последнего обрыва
+        uint64_t droppedRecords = 0;   // записей движения сброшено при обрывах
     };
 
     UdpBatchTransport() = default;
@@ -256,91 +313,43 @@ public:
         seq_ = (static_cast<uint64_t>(detail::Qpc::now()) << 20) ^ static_cast<uint64_t>(GetCurrentProcessId());
         failed_ = false;
         stopRx_ = false;
+        resetButtons();
+        resetControls();
+        resetLinkStats();
         rx_ = std::thread([this] { rxLoop(); });
 
-        auto kinds = query(kOpDevice, nullptr, 0, 150, 3);
-        if (!kinds || kinds->size() != 1) {
-            err = "MAKCU " + endpoint_ + " не ответил на DEVICE (0x02) - адрес/порт, плата в сети?";
+        if (!handshake(err, true)) {
             close();
             return false;
         }
-        if (!((*kinds)[0] & 1)) {
-            err = "маршрут мыши не активен (DEVICE без mouse) - мышь в host-порту MAKCU?";
-            close();
-            return false;
-        }
-        if (auto fw = query(kOpFirmware, nullptr, 0, 150, 3); fw && fw->size() == 4) firmware_ = detail::le32(fw->data());
-        if (firmware_ < kMinFirmware) {
-            err = "прошивка " + std::to_string(firmware_) + " без batch 0x6C (нужна V4.097+)";
-            close();
-            return false;
-        }
-        auto meta = queryMeta();
-        if (!meta) {
-            err = "нет ответа на 0x6A(id=0) - Raw API недоступен";
-            close();
-            return false;
-        }
-        uint32_t cleaned = 0;
-        if (meta->freeRecords < meta->capacity && meta->lastId > 0) {
-            cleaned = consumeLeftovers(meta->lastId, meta->capacity - meta->freeRecords);
-            if (auto again = queryMeta()) meta = again;
-        }
-        {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            pend_.clear();
-            flight_ = Flight{};
-            nextId_ = meta->lastId + 1;
-            haveX_ = false;
-            maxTerm_ = 0;
-        }
-        // Кнопки: включить поток событий мыши (запомнить, каким был), потом стартовая маска.
-        // Порядок важен: поток начинается с "всё отпущено", маска читается после включения.
-        resetButtons();
-        const uint8_t kindMouse[1] = {0x01};
-        if (auto was = query(kOpInputStream, kindMouse, 1, 100, 3); was && was->size() == 1) {
-            if ((*was)[0] != 1) {
-                const uint8_t on[2] = {0x01, 0x01};
-                if (sendNoReply(kOpInputStream, on, 2)) streamRestore_ = (*was)[0];
-            }
-            streamOk_ = true;
-        }
-        if (auto mask = query(kOpPhysButtons, nullptr, 0, 100, 3); mask && mask->size() == 1) {
-            mask_.store((*mask)[0], std::memory_order_release);
-            primed_.store(true, std::memory_order_release);
-            buttonsOk_ = true;
-        }
-        char buf[200];
-        std::snprintf(buf, sizeof(buf), "прошивка %u, schema %u, last_accepted_id %lu, свободно записей %u из %u",
-            firmware_, meta->schema, static_cast<unsigned long>(meta->lastId), meta->freeRecords, meta->capacity);
-        info_ = buf;
-        if (cleaned) info_ += ", дочищено записей прошлых сессий " + std::to_string(cleaned);
-        char bb[160];
-        if (buttonsOk_) {
-            std::snprintf(bb, sizeof(bb), ", кнопки: маска %02X, события 0x53 %s, страховочный опрос %.0f мс", mask_.load(),
-                !streamOk_ ? "недоступны" : streamRestore_ ? "включены" : "уже были включены",
-                detail::Qpc::toUs(pollTicks_.load()) / 1000.0);
-            info_ += bb;
-        } else {
-            info_ += ", кнопки: 0x55 не ответил";
-        }
-        nextPollT_ = detail::Qpc::now();
+        lastRxT_.store(detail::Qpc::now(), std::memory_order_release);
+        connected_ = true;
         ready_ = true;
+        watchdog_ = std::thread([this] { watchdogLoop(); });
         return true;
     }
 
     void close() {
-        const bool wasReady = ready_.exchange(false);
-        if (wasReady && streamRestore_ && sock_ != INVALID_SOCKET) {
-            // Вернуть INPUT_STREAM mouse, каким он был до open().
-            const uint8_t restore[2] = {0x01, *streamRestore_};
-            (void)sendNoReply(kOpInputStream, restore, 2);
+        if (ready_.load()) {
+            closing_ = true;
+            if (connected_.load()) {
+                flushControls(300);  // отпустить кнопки, снять блокировки
+                if (streamRestore_) {
+                    // Вернуть INPUT_STREAM mouse, каким он был до open().
+                    const uint8_t restore[2] = {0x01, *streamRestore_};
+                    (void)sendNoReply(kOpInputStream, restore, 2);
+                }
+            }
         }
+        ready_ = false;
+        stopRx_ = true;
+        if (watchdog_.joinable()) watchdog_.join();
+        if (rx_.joinable()) rx_.join();
+        closing_ = false;
+        connected_ = false;
         streamRestore_.reset();
         streamOk_ = false;
         buttonsOk_ = false;
-        stopRx_ = true;
-        if (rx_.joinable()) rx_.join();
         if (sock_ != INVALID_SOCKET) {
             closesocket(sock_);
             sock_ = INVALID_SOCKET;
@@ -351,15 +360,21 @@ public:
         }
     }
 
-    [[nodiscard]] bool healthy() const { return sock_ != INVALID_SOCKET && ready_.load() && !failed_.load(); }
+    // Можно звать move(): открыт, связь есть, протокол не нарушен.
+    [[nodiscard]] bool healthy() const {
+        return sock_ != INVALID_SOCKET && ready_.load() && connected_.load() && !failed_.load() && !closing_.load();
+    }
+    // Связь с платой есть (false - идёт переподключение).
+    [[nodiscard]] bool connected() const { return connected_.load(); }
     [[nodiscard]] const std::string& endpoint() const { return endpoint_; }
     [[nodiscard]] uint32_t firmware() const { return firmware_; }
     [[nodiscard]] const std::string& info() const { return info_; }
 
-    // ---- кнопки мыши (любой поток, не блокируют) ---------------------------------------
+    // ---- чтение кнопок мыши (любой поток, не блокируют) --------------------------------
     // Маска физических кнопок: bit0 левая, bit1 правая, bit2 средняя, bit3 side1, bit4 side2.
     // Обновляется событием 0x53 сразу по изменению (~1 мс); страховочный опрос 0x55
     // исправляет маску, если событие потерялось (UDP) или события не доходят совсем.
+    // Физика читается и у заблокированной кнопки (блокировка прячет её только от ПК).
     [[nodiscard]] uint8_t buttons() const { return mask_.load(std::memory_order_acquire); }
     [[nodiscard]] bool buttonDown(MouseButton b) const { return (buttons() & buttonBit(b)) != 0; }
     // Нажатий (переходов 0 -> 1) с open(). Разность двух чтений = нажатия между ними:
@@ -377,9 +392,52 @@ public:
         pollTicks_.store(ms > 0.0 ? detail::Qpc::fromUs(ms * 1000.0) : 0, std::memory_order_release);
     }
 
+    // ---- инжект кнопок (любой поток, не блокируют) -------------------------------------
+    // Нажать/отпустить кнопку программно (SET 0x11..0x15). Уходит следующей командой цикла,
+    // раньше движения из очереди (ждёт только команду, которая уже в полёте: ~1-2 мс).
+    // Время удержания и паузы задаёт вызывающий. Нажатие идёт в ПК вместе с физической
+    // кнопкой (ИЛИ): отпускание физической не отменяет инжектированное нажатие.
+    void press(MouseButton b) { setButtonState(b, true); }
+    void release(MouseButton b) { setButtonState(b, false); }
+    void setButtonState(MouseButton b, bool down) {
+        if (closing_.load()) return;
+        if (down) injectWanted_.fetch_or(buttonBit(b), std::memory_order_acq_rel);
+        else injectWanted_.fetch_and(static_cast<uint8_t>(~buttonBit(b)), std::memory_order_acq_rel);
+        kick();
+    }
+    void releaseAllButtons() {
+        injectWanted_.store(0, std::memory_order_release);
+        kick();
+    }
+    // Запрошенные инжектированные кнопки / что на плате по последнему снимку (до 250 мс).
+    [[nodiscard]] uint8_t injectedButtons() const { return injectWanted_.load(); }
+    [[nodiscard]] uint8_t injectedButtonsOnBoard() const { return boardButtons_.load(); }
+
+    // ---- блокировки физического ввода (любой поток, не блокируют) ---------------------
+    // Заблокировать/разблокировать физическую кнопку, ось или направление (SET LOCK 0x60).
+    // Заблокированное не доходит до ПК от физической мыши; инжект проходит. Применяется
+    // командой цикла, проверяется снимком, после переподключения восстанавливается.
+    void setLock(LockTarget t, bool locked) {
+        if (closing_.load()) return;
+        uint16_t cur = locksWanted_.load(std::memory_order_acquire);
+        for (;;) {
+            const uint16_t next = applyLock(cur, t, locked);
+            if (locksWanted_.compare_exchange_weak(cur, next, std::memory_order_acq_rel)) break;
+        }
+        kick();
+    }
+    void unlockAll() {
+        locksWanted_.store(0, std::memory_order_release);
+        kick();
+    }
+    [[nodiscard]] bool locked(LockTarget t) const { return (locksWanted_.load() & lockBit(t)) != 0; }
+    // Маска запрошенных блокировок (бит = номер цели) / что на плате по последнему снимку.
+    [[nodiscard]] uint16_t locks() const { return locksWanted_.load(); }
+    [[nodiscard]] uint16_t locksOnBoard() const { return boardLocks_.load(); }
+
     // ---- горячий путь -------------------------------------------------------------
-    // true - запись принята и уйдёт ровно одним HID-отчётом. false - очередь полна
-    // или транспорт неисправен: дельту хранит вызывающий.
+    // true - запись принята и уйдёт ровно одним HID-отчётом. false - очередь полна или
+    // связи нет: дельту хранит вызывающий.
     [[nodiscard]] bool move(int16_t dx, int16_t dy) {
         if (!healthy()) return false;
         if (dx == 0 && dy == 0) {
@@ -402,22 +460,22 @@ public:
         return accepted;
     }
 
-    // Отправить пакет, если предыдущий уже квитирован (обычно это делает поток приёма).
+    // Отправить команду, если предыдущая уже получила ответ (обычно это делает поток приёма).
     void service() {
-        if (!healthy()) return;
+        if (!ready_.load()) return;
         std::unique_lock<std::mutex> lock(sendMutex_, std::try_to_lock);
         if (lock.owns_lock()) (void)pumpLocked();
     }
 
     // Конец движения: дослать очередь, дождаться квитанции, освободить записи платы.
-    // true - всё отдано и плата чистая.
+    // true - всё отдано и плата чистая. Кнопки и блокировки не трогает (это close()).
     bool finish(int timeoutMs = 300) {
         const int64_t until = detail::Qpc::now() + detail::Qpc::fromUs(timeoutMs * 1000.0);
         bool done = false;
         while (detail::Qpc::now() < until && healthy()) {
             {
                 std::lock_guard<std::mutex> lock(stateMutex_);
-                done = pend_.empty() && !flight_.active && awaitSeq_.load() == 0;
+                done = pend_.empty() && !flight_.active && batchSeq_.load() == 0 && metaSeq_.load() == 0;
             }
             if (done) break;
             {
@@ -456,19 +514,37 @@ public:
         s.buttonMissed = buttonMissed_.load();
         s.buttonChanges = buttonChanges_.load();
         s.eventsMissing = eventsMissing();
+        s.injectWanted = injectWanted_.load();
+        s.injectOnBoard = boardButtons_.load();
+        s.locksWanted = locksWanted_.load();
+        s.locksOnBoard = boardLocks_.load();
+        s.buttonCommands = buttonCommands_.load();
+        s.lockCommands = lockCommands_.load();
+        s.snapshots = snapshots_.load();
+        s.snapshotLost = snapshotLost_.load();
+        s.repairs = repairs_.load();
+        s.streamRestores = streamRestores_.load();
+        s.connected = connected_.load();
+        s.linkLost = linkLost_.load();
+        s.reconnects = reconnects_.load();
+        s.lastOutageMs = lastOutageMs_.load();
+        s.droppedRecords = droppedRecords_.load();
         return s;
     }
 
     [[nodiscard]] std::string statsLine() const {
         const Stats s = stats();
-        char buf[1100];
+        char buf[1600];
         std::snprintf(buf, sizeof(buf),
             "batch 0x6C %s: записей %llu, пакетов %llu (%.2f/пакет), принято платой %llu | квитанций %llu, частичных %llu,"
             " отклонено %llu (X %llu), непонятных %llu | потеряно квитанций %llu, опросов %llu, поздних %llu"
             " | освобождено %llu, мин. свободно %d, more %llu | терминальных: отдано %llu, отказ %llu"
             " | очередь max %u, сейчас %u, полна %llu раз | RTT ср %.2f max %.2f мс | датаграмм %llu, ошибок send %llu"
             " | посл. причина %u | кнопки %02X: событий %llu, переполнений %llu, опросов %llu, ответов %llu,"
-            " потеряно %llu, найдено опросом %llu, изменений %llu%s",
+            " потеряно %llu, найдено опросом %llu, изменений %llu%s"
+            " | инжект %02X (плата %02X), команд %llu | блокировки %04X (плата %04X), команд %llu"
+            " | снимков %llu (потеряно %llu), исправлено %llu, поток событий включён заново %llu"
+            " | связь %s: обрывов %llu, переподключений %llu, посл. обрыв %.0f мс, сброшено записей %llu",
             endpoint_.c_str(), u(s.records), u(s.packets),
             s.packets ? static_cast<double>(s.records) / static_cast<double>(s.packets) : 0.0, u(s.admitted),
             u(s.receipts), u(s.partial), u(s.envelope), u(s.xRejected), u(s.badReplies), u(s.lostReceipts),
@@ -476,18 +552,29 @@ public:
             u(s.moreSet), u(s.termSubmitted), u(s.termRejected), s.maxPending, s.pending, u(s.busy), s.rttAvgMs,
             s.rttMaxMs, u(s.datagrams), u(s.sendErrors), s.lastReason, s.buttons, u(s.buttonEvents),
             u(s.buttonOverflows), u(s.buttonPolls), u(s.buttonReplies), u(s.buttonLost), u(s.buttonMissed),
-            u(s.buttonChanges), s.eventsMissing ? " | СОБЫТИЯ НЕ ДОХОДЯТ (брандмауэр?) - опрос 5 мс" : "");
+            u(s.buttonChanges), s.eventsMissing ? " | СОБЫТИЯ НЕ ДОХОДЯТ (брандмауэр?) - опрос 5 мс" : "",
+            s.injectWanted, s.injectOnBoard, u(s.buttonCommands), s.locksWanted, s.locksOnBoard, u(s.lockCommands),
+            u(s.snapshots), u(s.snapshotLost), u(s.repairs), u(s.streamRestores), s.connected ? "есть" : "НЕТ",
+            u(s.linkLost), u(s.reconnects), s.lastOutageMs, u(s.droppedRecords));
         return buf;
     }
 
 private:
     static constexpr uint8_t kOpDevice = 0x02;
     static constexpr uint8_t kOpFirmware = 0x04;
-    static constexpr uint8_t kOpRawAck = 0x6A;  // 0x6A(id=0): метаданные; (id, consume=1): освободить запись
-    static constexpr uint8_t kOpBatch = 0x6C;   // V4.097+: пакет Raw-записей + квитанция
-    static constexpr uint8_t kOpPhysButtons = 0x55;  // V4.036+: GET -> mask:u8 физических кнопок
+    static constexpr uint8_t kOpButtonBase = 0x11;   // SET LEFT..SIDE2 0x11..0x15 state:u8 (без ответа)
     static constexpr uint8_t kOpInputStream = 0x52;  // GET kind -> enabled; SET kind enabled (без ответа)
     static constexpr uint8_t kOpInputChange = 0x53;  // событие: kind:u8 id:u8 value:u8 (FF FF - переполнение)
+    static constexpr uint8_t kOpPhysButtons = 0x55;  // V4.036+: GET -> mask:u8 физических кнопок
+    static constexpr uint8_t kOpInjectSnapshot = 0x56;  // GET -> 40 байт: [0] инжект-кнопки, [1..2] блокировки
+    static constexpr uint8_t kOpLock = 0x60;         // SET target:u8 state:u8 (без ответа); GET target -> state
+    static constexpr uint8_t kOpRawAck = 0x6A;       // 0x6A(id=0): метаданные; (id, consume=1): освободить запись
+    static constexpr uint8_t kOpBatch = 0x6C;        // V4.097+: пакет Raw-записей + квитанция
+
+    // Блокировки, которые отправляются платой по отдельности: кнопки и направления осей.
+    // Биты осей целиком (X 5, Y 8, Wheel 11) плата выставляет сама, когда заблокированы оба направления.
+    static constexpr uint16_t kLockAll = 0x3FFF;
+    static constexpr uint16_t kLockSendable = 0x1F | 1u << 6 | 1u << 7 | 1u << 9 | 1u << 10 | 1u << 12 | 1u << 13;
 
     static unsigned long long u(uint64_t v) { return static_cast<unsigned long long>(v); }
     static constexpr DWORD kTimerHighResolution = 0x00000002;  // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+)
@@ -510,17 +597,213 @@ private:
         uint8_t capacity = 0;
     };
 
-    // ---- служебный обмен (open/finish, не горячий путь) -------------------------------
+    // ---- блокировки: нормальная форма маски ------------------------------------------
+    // У платы по оси два бита (+ и -); бит оси целиком она выставляет сама, когда стоят оба
+    // (замер: "+X, затем -X" -> {X,+X,-X}; "X, затем снять +X" -> {-X}). Поэтому бит оси
+    // никогда не берётся на вход, а только вычисляется из направлений.
+    static uint16_t normalizeLocks(uint16_t m) {
+        m &= kLockAll;
+        for (const uint8_t axis : {5, 8, 11}) {
+            const uint16_t whole = static_cast<uint16_t>(1u << axis);
+            const uint16_t pos = static_cast<uint16_t>(1u << (axis + 1));
+            const uint16_t neg = static_cast<uint16_t>(1u << (axis + 2));
+            m &= static_cast<uint16_t>(~whole);
+            if ((m & pos) && (m & neg)) m |= whole;
+        }
+        return m;
+    }
+    // Ось целиком = оба её направления.
+    static uint16_t applyLock(uint16_t m, LockTarget t, bool on) {
+        const uint8_t i = static_cast<uint8_t>(t);
+        if (i >= kLockTargetCount) return m;
+        uint16_t bits = static_cast<uint16_t>(1u << i);
+        if (i == 5 || i == 8 || i == 11) bits = static_cast<uint16_t>(1u << (i + 1) | 1u << (i + 2));
+        if (on) m |= bits;
+        else m &= static_cast<uint16_t>(~bits);
+        return normalizeLocks(m);
+    }
+
+    // ---- открытие и переподключение ---------------------------------------------------
+    // Рукопожатие с платой. initial: open() (запомнить исходный поток событий, сбросить
+    // состояние); иначе переподключение (продолжить id, восстановить запрошенное).
+    bool handshake(std::string& err, bool initial) {
+        auto kinds = query(kOpDevice, nullptr, 0, 150, initial ? 3 : 1);
+        if (!kinds || kinds->size() != 1) {
+            err = "MAKCU " + endpoint_ + " не ответил на DEVICE (0x02) - адрес/порт, плата в сети?";
+            return false;
+        }
+        if (!((*kinds)[0] & 1)) {
+            err = "маршрут мыши не активен (DEVICE без mouse) - мышь в host-порту MAKCU?";
+            return false;
+        }
+        if (auto fw = query(kOpFirmware, nullptr, 0, 150, 3); fw && fw->size() == 4) firmware_ = detail::le32(fw->data());
+        if (firmware_ < kMinFirmware) {
+            err = "прошивка " + std::to_string(firmware_) + " без batch 0x6C (нужна V4.097+)";
+            return false;
+        }
+        auto meta = queryMeta();
+        if (!meta) {
+            err = "нет ответа на 0x6A(id=0) - Raw API недоступен";
+            return false;
+        }
+        uint32_t cleaned = 0;
+        if (meta->freeRecords < meta->capacity && meta->lastId > 0) {
+            cleaned = consumeLeftovers(meta->lastId, meta->capacity - meta->freeRecords);
+            if (auto again = queryMeta()) meta = again;
+        }
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            if (initial) {
+                pend_.clear();
+                nextId_ = meta->lastId + 1;
+            } else {
+                nextId_ = std::max(nextId_, meta->lastId + 1);  // id строго растут (после перезагрузки платы - тоже)
+            }
+            flight_ = Flight{};
+            haveX_ = false;
+            maxTerm_ = 0;
+        }
+        // Поток событий мыши: включить (запомнить, каким был при open()), потом маска.
+        // Порядок важен: поток начинается с "всё отпущено", маска читается после включения.
+        const uint8_t kindMouse[1] = {0x01};
+        if (auto was = query(kOpInputStream, kindMouse, 1, 100, 3); was && was->size() == 1) {
+            if ((*was)[0] != 1) {
+                const uint8_t on[2] = {0x01, 0x01};
+                if (sendNoReply(kOpInputStream, on, 2) && initial) streamRestore_ = (*was)[0];
+            }
+            streamOk_ = true;
+        }
+        if (auto mask = query(kOpPhysButtons, nullptr, 0, 100, 3); mask && mask->size() == 1) {
+            if (initial) {
+                mask_.store((*mask)[0], std::memory_order_release);
+                primed_.store(true, std::memory_order_release);
+            } else {
+                applyMask((*mask)[0], false);  // изменения за время обрыва - как обычные
+            }
+            buttonsOk_ = true;
+        }
+        // Инжект и блокировки: что сейчас на плате (после упавшей программы, перезагрузки).
+        // Цикл сравнит с запрошенным и дошлёт разницу: при open() запрошено "ничего".
+        std::optional<std::vector<uint8_t>> snap = query(kOpInjectSnapshot, nullptr, 0, 100, 3);
+        uint8_t onBoardB = 0;
+        uint16_t onBoardL = 0;
+        if (snap && snap->size() >= 3) {
+            onBoardB = static_cast<uint8_t>((*snap)[0] & 0x1F);
+            onBoardL = normalizeLocks(static_cast<uint16_t>((*snap)[1] | (*snap)[2] << 8));
+        }
+        {
+            std::lock_guard<std::mutex> lock(sendMutex_);
+            sentButtons_ = onBoardB;
+            sentLocks_ = onBoardL;
+            boardButtons_ = onBoardB;
+            boardLocks_ = onBoardL;
+            ctlEpoch_ = boardEpoch_ = 0;
+            verifyDue_ = false;
+            const int64_t now = detail::Qpc::now();
+            nextPollT_ = now;
+            nextSnapT_ = now + detail::Qpc::fromUs(kHeartbeatUs);
+            nextStreamCheckT_ = now + detail::Qpc::fromUs(kStreamCheckUs);
+        }
+        if (initial) {
+            char buf[200];
+            std::snprintf(buf, sizeof(buf), "прошивка %u, schema %u, last_accepted_id %lu, свободно записей %u из %u",
+                firmware_, meta->schema, static_cast<unsigned long>(meta->lastId), meta->freeRecords, meta->capacity);
+            info_ = buf;
+            if (cleaned) info_ += ", дочищено записей прошлых сессий " + std::to_string(cleaned);
+            char bb[200];
+            if (buttonsOk_) {
+                std::snprintf(bb, sizeof(bb), ", кнопки: маска %02X, события 0x53 %s, страховочный опрос %.0f мс", mask_.load(),
+                    !streamOk_ ? "недоступны" : streamRestore_ ? "включены" : "уже были включены",
+                    detail::Qpc::toUs(pollTicks_.load()) / 1000.0);
+                info_ += bb;
+            } else {
+                info_ += ", кнопки: 0x55 не ответил";
+            }
+            if (onBoardB || onBoardL) {
+                std::snprintf(bb, sizeof(bb), ", осталось от прошлой программы: инжект %02X, блокировки %04X - снимаю",
+                    onBoardB, onBoardL);
+                info_ += bb;
+            }
+        }
+        return true;
+    }
+
+    // Сторожевой поток: связь пропала - переподключиться и восстановить запрошенное.
+    void watchdogLoop() {
+        int64_t nextTry = 0;
+        while (!stopRx_.load()) {
+            Sleep(20);
+            if (!ready_.load() || closing_.load()) continue;
+            const int64_t now = detail::Qpc::now();
+            if (connected_.load()) {
+                if (now - lastRxT_.load(std::memory_order_acquire) > detail::Qpc::fromUs(kLinkLostUs)) {
+                    std::lock_guard<std::mutex> lock(sendMutex_);
+                    declareLostLocked(now);
+                    nextTry = now;
+                }
+                continue;
+            }
+            if (now < nextTry) continue;
+            nextTry = now + detail::Qpc::fromUs(kReconnectRetryUs);
+            std::string err;
+            if (!handshake(err, false)) continue;
+            const int64_t back = detail::Qpc::now();
+            lastRxT_.store(back, std::memory_order_release);
+            lastOutageMs_.store(detail::Qpc::toUs(back - lostT_) / 1000.0);
+            reconnects_.fetch_add(1, std::memory_order_relaxed);
+            connected_ = true;
+            kick();
+        }
+    }
+
+    // Под sendMutex_: связь потеряна. Всё, что было в полёте, забыть; записи движения,
+    // не дошедшие до платы, сбросить (к моменту восстановления они устареют).
+    void declareLostLocked(int64_t now) {
+        connected_ = false;
+        lostT_ = now;
+        linkLost_.fetch_add(1, std::memory_order_relaxed);
+        batchSeq_ = metaSeq_ = physSeq_ = snapSeq_ = streamSeq_ = 0;
+        awaitSeq_.store(0, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        uint64_t dropped = pend_.size();
+        if (flight_.active) dropped += flight_.n;
+        droppedRecords_.fetch_add(dropped, std::memory_order_relaxed);
+        pend_.clear();
+        flight_.active = false;
+    }
+
+    // close(): отпустить кнопки, снять блокировки и дождаться подтверждения снимком.
+    void flushControls(int timeoutMs) {
+        injectWanted_.store(0, std::memory_order_release);
+        locksWanted_.store(0, std::memory_order_release);
+        const int64_t until = detail::Qpc::now() + detail::Qpc::fromUs(timeoutMs * 1000.0);
+        while (detail::Qpc::now() < until && connected_.load()) {
+            {
+                std::lock_guard<std::mutex> lock(sendMutex_);
+                (void)pumpLocked();
+                if (sentButtons_ == 0 && sentLocks_ == 0 && boardEpoch_ == ctlEpoch_ && boardButtons_.load() == 0 &&
+                    boardLocks_.load() == 0 && awaitSeq_.load() == 0) {
+                    return;
+                }
+            }
+            Sleep(1);
+        }
+    }
+
+    // ---- служебный обмен (open/finish/переподключение, не горячий путь) -----------------
     std::optional<std::vector<uint8_t>> query(uint8_t op, const uint8_t* payload, uint16_t len, int timeoutMs,
         int tries) {
         for (int attempt = 0; attempt < tries; ++attempt) {
             uint64_t seq = 0;
             {
-                // Одна команда в полёте: дождаться ответа на пакет/опрос цикла. Пока держим
-                // sendMutex_, поток приёма новых не отправит.
+                // Одна команда в полёте: дождаться ответа на команду цикла и паузы после
+                // команды без ответа. Пока держим sendMutex_, поток приёма новых не отправит.
                 std::lock_guard<std::mutex> lock(sendMutex_);
                 const int64_t idleBy = detail::Qpc::now() + detail::Qpc::fromUs(kLostUs);
-                while (awaitSeq_.load(std::memory_order_acquire) != 0 && detail::Qpc::now() < idleBy) YieldProcessor();
+                while ((awaitSeq_.load(std::memory_order_acquire) != 0 || detail::Qpc::now() < gapUntil_) &&
+                       detail::Qpc::now() < idleBy) {
+                    YieldProcessor();
+                }
                 seq = ++seq_;
                 {
                     std::lock_guard<std::mutex> sl(syncMutex_);
@@ -571,6 +854,7 @@ private:
 
     // ---- отправка -----------------------------------------------------------------------
     // Под sendMutex_. Датаграмма = 0x55 | nonce u64 | DE AD | LEN u16 | op | payload.
+    // Ошибка сети (кабель, адаптер) не делает транспорт неисправным: обрыв заметит сторож.
     bool sendFrameLocked(uint64_t seq, uint8_t op, const uint8_t* payload, uint16_t len) {
         std::array<uint8_t, 14 + 8 + 10 * kMaxRecords> d{};
         size_t n = 0;
@@ -587,36 +871,59 @@ private:
             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
         if (rc != static_cast<int>(n)) {
             sendErrors_.fetch_add(1, std::memory_order_relaxed);
-            if (WSAGetLastError() != WSAEWOULDBLOCK) failed_ = true;
             return false;
         }
         datagrams_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
-    // Служебная команда без ответа (SET 0x52): дождаться, пока цикл свободен, отправить и
-    // переждать передачу на второй чип (иначе следующая команда может потеряться).
+    // Команда без ответа вне цикла (SET 0x52 в open/close): дождаться, пока цикл свободен,
+    // отправить и переждать передачу на второй чип.
     bool sendNoReply(uint8_t op, const uint8_t* payload, uint16_t len) {
         std::lock_guard<std::mutex> lock(sendMutex_);
         const int64_t idleBy = detail::Qpc::now() + detail::Qpc::fromUs(kLostUs);
-        while (awaitSeq_.load(std::memory_order_acquire) != 0 && detail::Qpc::now() < idleBy) YieldProcessor();
+        while ((awaitSeq_.load(std::memory_order_acquire) != 0 || detail::Qpc::now() < gapUntil_) &&
+               detail::Qpc::now() < idleBy) {
+            YieldProcessor();
+        }
         const bool ok = sendFrameLocked(++seq_, op, payload, len);
-        Sleep(5);
+        gapUntil_ = detail::Qpc::now() + detail::Qpc::fromUs(kNoReplyGapUs);
+        while (detail::Qpc::now() < gapUntil_) YieldProcessor();
         return ok;
     }
 
-    // Под sendMutex_. Следующий пакет из очереди, если предыдущий получил квитанцию.
-    // Нет квитанции kLostUs - опрос 0x6A(id=0) (повторяется, пока нет ответа).
+    // Разбудить цикл из любого потока (кнопки, блокировки): отправить сразу, если свободен.
+    void kick() {
+        if (!ready_.load()) return;
+        std::unique_lock<std::mutex> lock(sendMutex_, std::try_to_lock);
+        if (lock.owns_lock()) (void)pumpLocked();
+    }
+
+    // Под sendMutex_. Одна команда в полёте, по приоритету:
+    //   1) ответ не пришёл вовремя - разобрать (потерянная квитанция -> опрос 0x6A);
+    //   2) пауза после команды без ответа;
+    //   3) кнопки и блокировки (SET без ответа), затем сверка снимком 0x56;
+    //   4) пульс-снимок, проверка потока событий, страховочный опрос кнопок 0x55;
+    //   5) пакет движения 0x6C.
     bool pumpLocked() {
-        if (!healthy()) return false;
+        if (!ready_.load() || failed_.load() || !connected_.load()) return false;
         const int64_t now = detail::Qpc::now();
         if (const uint64_t a = awaitSeq_.load(std::memory_order_acquire); a != 0) {
             const int64_t waited = now - awaitT_.load(std::memory_order_relaxed);
-            if (a == physSeq_.load(std::memory_order_acquire)) {
-                // Опрос кнопок без ответа: забыть его, движение не ждёт.
+            if (a == physSeq_.load(std::memory_order_acquire) || a == snapSeq_.load(std::memory_order_acquire) ||
+                a == streamSeq_.load(std::memory_order_acquire)) {
+                // Опрос/снимок без ответа: забыть его, движение не ждёт (снимок повторится).
                 if (waited < detail::Qpc::fromUs(kPollLostUs)) return false;
-                buttonLost_.fetch_add(1, std::memory_order_relaxed);
-                physSeq_.store(0, std::memory_order_relaxed);
+                if (a == physSeq_.load()) {
+                    buttonLost_.fetch_add(1, std::memory_order_relaxed);
+                    physSeq_ = 0;
+                } else if (a == snapSeq_.load()) {
+                    snapshotLost_.fetch_add(1, std::memory_order_relaxed);
+                    snapSeq_ = 0;
+                    verifyDue_ = true;
+                } else {
+                    streamSeq_ = 0;
+                }
                 clearAwait(a);
                 return false;
             }
@@ -634,6 +941,62 @@ private:
             }
             const uint8_t zero[5] = {0, 0, 0, 0, 0};
             (void)sendFrameLocked(seq, kOpRawAck, zero, 5);  // не ушёл - повтор через kLostUs
+            return true;
+        }
+        if (now < gapUntil_) return false;  // после команды без ответа
+
+        // Снимок пришёл: на плате может быть не то, что мы отправляли - разница уйдёт ниже.
+        if (snapFresh_.exchange(false, std::memory_order_acq_rel)) {
+            const uint8_t b = boardButtons_.load();
+            const uint16_t l = boardLocks_.load();
+            if (boardEpoch_ == ctlEpoch_ && (b != sentButtons_ || l != sentLocks_)) {
+                repairs_.fetch_add(1, std::memory_order_relaxed);
+                sentButtons_ = b;
+                sentLocks_ = l;
+            }
+        }
+        if (sendControlLocked(now)) return true;
+        if (streamReenable_.exchange(false, std::memory_order_acq_rel)) {
+            const uint8_t on[2] = {0x01, 0x01};
+            if (sendFrameLocked(++seq_, kOpInputStream, on, 2)) {
+                streamRestores_.fetch_add(1, std::memory_order_relaxed);
+                gapUntil_ = now + detail::Qpc::fromUs(kNoReplyGapUs);
+                return true;
+            }
+            streamReenable_ = true;
+            return false;
+        }
+        // Сверка после команд и пульс связи.
+        if (verifyDue_ || now >= nextSnapT_) {
+            verifyDue_ = false;
+            nextSnapT_ = now + detail::Qpc::fromUs(kHeartbeatUs);
+            const uint64_t ss = ++seq_;
+            snapEpoch_ = ctlEpoch_;
+            snapSeq_.store(ss, std::memory_order_release);
+            awaitT_.store(now, std::memory_order_relaxed);
+            awaitSeq_.store(ss, std::memory_order_release);
+            if (!sendFrameLocked(ss, kOpInjectSnapshot, nullptr, 0)) {
+                snapSeq_ = 0;
+                clearAwait(ss);
+                verifyDue_ = true;
+                return false;
+            }
+            snapshots_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        // Поток событий всё ещё включён? (после перезагрузки платы - нет)
+        if (streamOk_ && now >= nextStreamCheckT_) {
+            nextStreamCheckT_ = now + detail::Qpc::fromUs(kStreamCheckUs);
+            const uint64_t ss = ++seq_;
+            const uint8_t kind[1] = {0x01};
+            streamSeq_.store(ss, std::memory_order_release);
+            awaitT_.store(now, std::memory_order_relaxed);
+            awaitSeq_.store(ss, std::memory_order_release);
+            if (!sendFrameLocked(ss, kOpInputStream, kind, 1)) {
+                streamSeq_ = 0;
+                clearAwait(ss);
+                return false;
+            }
             return true;
         }
         // Опрос кнопок по расписанию: одна команда, ответ ~1 мс, потом снова движение.
@@ -704,6 +1067,34 @@ private:
         return true;
     }
 
+    // Под sendMutex_: одна команда кнопки или блокировки, если запрошенное отличается от
+    // отправленного. Кнопки раньше блокировок. После неё - пауза и сверка снимком.
+    bool sendControlLocked(int64_t now) {
+        const uint8_t wantB = static_cast<uint8_t>(injectWanted_.load(std::memory_order_acquire) & 0x1F);
+        if (const uint8_t diff = static_cast<uint8_t>(wantB ^ sentButtons_); diff) {
+            uint8_t i = 0;
+            while (!(diff & (1u << i))) ++i;
+            const uint8_t state = static_cast<uint8_t>((wantB >> i) & 1u);
+            if (!sendFrameLocked(++seq_, static_cast<uint8_t>(kOpButtonBase + i), &state, 1)) return false;
+            sentButtons_ = static_cast<uint8_t>(sentButtons_ ^ (1u << i));
+            buttonCommands_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const uint16_t wantL = locksWanted_.load(std::memory_order_acquire);
+            const uint16_t diffL = static_cast<uint16_t>((wantL ^ sentLocks_) & kLockSendable);
+            if (!diffL) return false;
+            uint8_t i = 0;
+            while (!(diffL & (1u << i))) ++i;
+            const uint8_t pl[2] = {i, static_cast<uint8_t>((wantL >> i) & 1u)};
+            if (!sendFrameLocked(++seq_, kOpLock, pl, 2)) return false;
+            sentLocks_ = normalizeLocks(static_cast<uint16_t>(sentLocks_ ^ (1u << i)));
+            lockCommands_.fetch_add(1, std::memory_order_relaxed);
+        }
+        ++ctlEpoch_;
+        verifyDue_ = true;
+        gapUntil_ = now + detail::Qpc::fromUs(kNoReplyGapUs);
+        return true;
+    }
+
     // Снять ожидание, если ждём именно этот nonce (иначе там уже другая команда).
     void clearAwait(uint64_t seq) {
         uint64_t expected = seq;
@@ -739,6 +1130,15 @@ private:
         applyMask(p[2] ? static_cast<uint8_t>(old | bit) : static_cast<uint8_t>(old & ~bit), false);
     }
 
+    // Поток приёма: снимок 0x56 - инжектированные кнопки и блокировки на плате.
+    void onSnapshot(const uint8_t* p, size_t plen) {
+        if (plen < 3) return;
+        boardButtons_.store(static_cast<uint8_t>(p[0] & 0x1F), std::memory_order_release);
+        boardLocks_.store(normalizeLocks(static_cast<uint16_t>(p[1] | p[2] << 8)), std::memory_order_release);
+        boardEpoch_.store(snapEpoch_.load(std::memory_order_acquire), std::memory_order_release);
+        snapFresh_.store(true, std::memory_order_release);
+    }
+
     // События не доходят: ни одного, а опрос уже находил изменения.
     [[nodiscard]] bool eventsMissing() const {
         return buttonEvents_.load(std::memory_order_relaxed) == 0 &&
@@ -751,6 +1151,27 @@ private:
         pollNow_.store(false, std::memory_order_release);
         for (auto& c : presses_) c.store(0, std::memory_order_release);
         buttonEvents_ = buttonOverflows_ = buttonPolls_ = buttonReplies_ = buttonLost_ = buttonMissed_ = buttonChanges_ = 0;
+    }
+
+    void resetControls() {
+        injectWanted_ = 0;
+        locksWanted_ = 0;
+        boardButtons_ = 0;
+        boardLocks_ = 0;
+        sentButtons_ = 0;
+        sentLocks_ = 0;
+        snapFresh_ = false;
+        streamReenable_ = false;
+        buttonCommands_ = lockCommands_ = snapshots_ = snapshotLost_ = repairs_ = streamRestores_ = 0;
+        batchSeq_ = metaSeq_ = physSeq_ = snapSeq_ = streamSeq_ = 0;
+        awaitSeq_ = 0;
+        gapUntil_ = 0;
+    }
+
+    void resetLinkStats() {
+        linkLost_ = reconnects_ = droppedRecords_ = 0;
+        lastOutageMs_ = 0.0;
+        connected_ = false;
     }
 
     // Под stateMutex_: записи пакета с индекса from - обратно в начало очереди (порядок сохраняется).
@@ -767,9 +1188,9 @@ private:
     }
 
     // ---- приём ----------------------------------------------------------------------------
-    // Ждёт датаграмму или тик 1 мс (опрос кнопок, тайм-ауты). Тик - high-resolution
-    // waitable timer: он точен без timeBeginPeriod(1), а select()/Sleep() без него
-    // просыпаются по тику планировщика (~15.6 мс) и опрос кнопок шёл бы реже.
+    // Ждёт датаграмму или тик 1 мс (опросы, тайм-ауты). Тик - high-resolution waitable
+    // timer: он точен без timeBeginPeriod(1), а select()/Sleep() без него просыпаются по
+    // тику планировщика (~15.6 мс) и опросы шли бы реже.
     void rxLoop() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, kTimerHighResolution, TIMER_ALL_ACCESS);
@@ -794,7 +1215,7 @@ private:
                 if (from.sin_addr.s_addr != remote_.sin_addr.s_addr) continue;
                 onDatagram(buf.data(), static_cast<size_t>(n));
             }
-            // Сразу по квитанции следующий пакет. Отправку держит другой поток - не ждём.
+            // Сразу по ответу следующая команда. Отправку держит другой поток - не ждём.
             if (ready_.load(std::memory_order_relaxed)) {
                 std::unique_lock<std::mutex> lock(sendMutex_, std::try_to_lock);
                 if (lock.owns_lock()) (void)pumpLocked();
@@ -814,6 +1235,7 @@ private:
         for (int i = 0; i < 8; ++i) seq |= static_cast<uint64_t>(d[1 + i]) << (8 * i);
         const size_t plen = static_cast<size_t>(d[11]) | static_cast<size_t>(d[12]) << 8;
         if (14 + plen > n) return;
+        lastRxT_.store(detail::Qpc::now(), std::memory_order_release);  // пульс: плата на связи
         const uint8_t* p = d + 14;  // d[13] - опкод ответа
         // Событие 0x53 несёт nonce одной из наших прошлых команд - разбирать по опкоду
         // ДО сопоставления по nonce, иначе его можно принять за квитанцию пакета.
@@ -838,6 +1260,18 @@ private:
                 buttonReplies_.fetch_add(1, std::memory_order_relaxed);
             }
             physSeq_.store(0, std::memory_order_relaxed);
+            clearAwait(seq);
+            return;
+        }
+        if (seq != 0 && seq == snapSeq_.load(std::memory_order_acquire)) {
+            onSnapshot(p, plen);
+            snapSeq_.store(0, std::memory_order_relaxed);
+            clearAwait(seq);
+            return;
+        }
+        if (seq != 0 && seq == streamSeq_.load(std::memory_order_acquire)) {
+            if (plen == 1 && p[0] != 1) streamReenable_.store(true, std::memory_order_release);
+            streamSeq_.store(0, std::memory_order_relaxed);
             clearAwait(seq);
             return;
         }
@@ -933,20 +1367,26 @@ private:
     uint32_t firmware_ = 0;
     std::atomic<bool> ready_{false};
     std::atomic<bool> failed_{false};
+    std::atomic<bool> closing_{false};
 
-    std::mutex sendMutex_;  // отправка и seq_
+    std::mutex sendMutex_;  // отправка, seq_ и всё, что помечено "под sendMutex_"
     uint64_t seq_ = 0;
-    std::atomic<uint64_t> awaitSeq_{0};  // nonce пакета/опроса в полёте (0 - можно слать)
-    std::atomic<uint64_t> batchSeq_{0};  // nonce пакета, ждущего квитанции
-    std::atomic<uint64_t> metaSeq_{0};   // nonce опроса после потери
-    std::atomic<uint64_t> physSeq_{0};   // nonce опроса кнопок 0x55
-    int64_t nextPollT_ = 0;              // под sendMutex_: когда следующий опрос кнопок
+    std::atomic<uint64_t> awaitSeq_{0};   // nonce команды в полёте (0 - можно слать)
+    std::atomic<uint64_t> batchSeq_{0};   // nonce пакета, ждущего квитанции
+    std::atomic<uint64_t> metaSeq_{0};    // nonce опроса после потери
+    std::atomic<uint64_t> physSeq_{0};    // nonce опроса кнопок 0x55
+    std::atomic<uint64_t> snapSeq_{0};    // nonce снимка 0x56
+    std::atomic<uint64_t> streamSeq_{0};  // nonce проверки потока 0x52
+    int64_t gapUntil_ = 0;                // под sendMutex_: до этого момента не слать (после команды без ответа)
+    int64_t nextPollT_ = 0;               // под sendMutex_: когда следующий опрос кнопок
+    int64_t nextSnapT_ = 0;               // под sendMutex_: когда следующий пульс-снимок
+    int64_t nextStreamCheckT_ = 0;        // под sendMutex_: когда проверить поток событий
     std::atomic<int64_t> pollTicks_{detail::Qpc::fromUs(kDefaultButtonPollMs * 1000.0)};
     std::atomic<int64_t> awaitT_{0};
     std::atomic<uint64_t> datagrams_{0};
     std::atomic<uint64_t> sendErrors_{0};
 
-    // Кнопки: маска пишет только поток приёма (и open()), читают все.
+    // Чтение кнопок: маску пишет только поток приёма (и рукопожатие), читают все.
     std::atomic<bool> buttonsOk_{false};
     std::atomic<uint8_t> mask_{0};
     std::array<std::atomic<uint32_t>, kMouseButtonCount> presses_{};
@@ -956,7 +1396,32 @@ private:
     std::atomic<bool> pollNow_{false};  // переполнение потока: опросить сразу
     std::optional<uint8_t> streamRestore_;  // INPUT_STREAM mouse до open(), если меняли
     bool streamOk_ = false;                 // плата ответила на GET 0x52
+    std::atomic<bool> streamReenable_{false};  // проверка нашла поток выключенным
     sockaddr_in remote_{};                  // адрес платы (сокет без connect())
+
+    // Инжект и блокировки: запрошенное пишут вызывающие (любой поток), отправленное -
+    // цикл под sendMutex_, состояние платы - поток приёма по снимку.
+    std::atomic<uint8_t> injectWanted_{0};
+    std::atomic<uint16_t> locksWanted_{0};
+    std::atomic<uint8_t> boardButtons_{0};
+    std::atomic<uint16_t> boardLocks_{0};
+    std::atomic<bool> snapFresh_{false};
+    uint8_t sentButtons_ = 0;    // под sendMutex_
+    uint16_t sentLocks_ = 0;     // под sendMutex_ (нормальная форма)
+    uint64_t ctlEpoch_ = 0;                // под sendMutex_: номер последней команды кнопки/блокировки
+    std::atomic<uint64_t> snapEpoch_{0};   // ctlEpoch_ на момент отправки снимка (читает поток приёма)
+    std::atomic<uint64_t> boardEpoch_{0};  // ctlEpoch_, к которому относится последний снимок
+    bool verifyDue_ = false;     // под sendMutex_: после команд нужен снимок
+    std::atomic<uint64_t> buttonCommands_{0}, lockCommands_{0}, snapshots_{0}, snapshotLost_{0}, repairs_{0},
+        streamRestores_{0};
+
+    // Связь
+    std::atomic<bool> connected_{false};
+    std::atomic<int64_t> lastRxT_{0};
+    int64_t lostT_ = 0;
+    std::atomic<uint64_t> linkLost_{0}, reconnects_{0}, droppedRecords_{0};
+    std::atomic<double> lastOutageMs_{0.0};
+    std::thread watchdog_;
 
     std::thread rx_;
     std::atomic<bool> stopRx_{false};
