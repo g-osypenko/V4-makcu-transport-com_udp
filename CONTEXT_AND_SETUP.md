@@ -2,6 +2,14 @@
 
 Точка входа в проект. Актуально на **2026-10-12**. Подробности — в README папок, ссылки ниже.
 
+> ## Идеальный транспорт (берите отсюда)
+>
+> - **UDP / Ethernet, ~1000 Гц** — [`basics/udp_way/perfect-transport-udp/`](basics/udp_way/perfect-transport-udp/README.md) (`makcu_udp_batch_transport.h`)
+> - **COM / USB2, ~1000 Гц** — [`basics/comport_way/perfect-transport-comport/`](basics/comport_way/perfect-transport-comport/README.md) (`makcu_raw_transport.h`)
+>
+> Один заголовок на WinAPI, одинаковый API (движение, кнопки, инжект, блокировки, автопереподключение).
+> English: [`ENG_CONTEXT_AND_SETUP.md`](ENG_CONTEXT_AND_SETUP.md).
+
 > ## ⚠ Обязательная настройка Windows для UDP: брандмауэр
 >
 > Плата присылает события кнопок `0x53` **с порта, равного порту программы, а не с 8080**. Если сеть с
