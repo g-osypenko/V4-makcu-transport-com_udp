@@ -1,6 +1,7 @@
 // Пример и самопроверка makcu_udp_batch_transport.h.
 //
-//   example_line.exe [--host 192.168.50.175] [--port 8080] [--check] [--buttons S]
+//   example_line.exe [--host auto|IP|MAC] [--port 8080] [--check] [--buttons S]
+//     --host       адрес платы, по умолчанию auto: найти в сети (makcu_udp_discover.h)
 //     --check      связь + прошивка + Raw-метаданные, курсор не двигается
 //     --buttons S  S секунд показывать кнопки мыши (нажимайте), курсор не двигается
 //     без них 2 с по X: 1 с вправо, 1 с влево по 2 отсчёта каждую 1 мс
@@ -11,6 +12,7 @@
 // Частоту HID пример считает низкоуровневым хуком мыши (WH_MOUSE_LL): каждый
 // HID-отчёт MAKCU, который увидел Windows, независимо от фокуса окна.
 #include "makcu_udp_batch_transport.h"
+#include "makcu_udp_discover.h"
 
 #include <timeapi.h>
 
@@ -59,7 +61,7 @@ void hookMain(std::atomic<bool>* ready) {
 
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
-    std::string host = "192.168.50.175";
+    std::string host = "auto";
     uint16_t port = makcu::UdpBatchTransport::kDefaultPort;
     bool check = false;
     double buttonsS = 0.0;
@@ -69,14 +71,14 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--check") == 0) check = true;
         else if (std::strcmp(argv[i], "--buttons") == 0 && i + 1 < argc) buttonsS = std::atof(argv[++i]);
         else {
-            std::printf("example_line.exe [--host 192.168.50.175] [--port 8080] [--check] [--buttons S]\n");
+            std::printf("example_line.exe [--host auto|IP|MAC] [--port 8080] [--check] [--buttons S]\n");
             return 2;
         }
     }
 
     makcu::UdpBatchTransport tx;
     std::string err;
-    if (!tx.open(host, port, err)) {
+    if (!makcu::resolveUdpHost(host, port, err) || !tx.open(host, port, err)) {
         std::printf("[-] %s\n", err.c_str());
         return 1;
     }

@@ -17,22 +17,17 @@
 > режет** эти пакеты для любой программы без разрешающего правила. Движение при этом работает, а кнопки
 > держатся только на запасном опросе 5 мс (в `statsLine()`: «СОБЫТИЯ НЕ ДОХОДЯТ»).
 >
-> **Один раз, PowerShell от администратора**, один из вариантов:
+> **Один раз:** запустить `basics/udp_way/perfect-transport-udp/setup_firewall.bat` (двойной клик, права
+> спросит UAC). Он создаёт или заменяет правило «MAKCU UDP events»: входящий UDP от локальной подсети для
+> любой программы, так что IP платы знать не нужно. Проверка без прав: `.\setup_firewall.bat -Check` из этой папки.
+> Параметры и цена такого правила — в начале README этой папки.
 >
-> ```powershell
-> # разрешить входящие UDP только от платы, для любой программы (рекомендуется; у нас сделано 2026-10-12)
-> New-NetFirewallRule -DisplayName "MAKCU UDP events" -Direction Inbound -Protocol UDP -RemoteAddress 192.168.50.175 -Action Allow
-> ```
+> Вместо правила можно пометить сеть как частную (у нас брандмауэр Private выключен):
+> `Set-NetConnectionProfile -InterfaceAlias "Ethernet" -NetworkCategory Private`.
 >
-> или пометить сеть как частную (у нас брандмауэр Private выключен):
->
-> ```powershell
-> Set-NetConnectionProfile -InterfaceAlias "Ethernet" -NetworkCategory Private
-> ```
->
-> **Если IP платы сменится** (DHCP), правило с `-RemoteAddress` надо поправить:
-> `Set-NetFirewallRule -DisplayName "MAKCU UDP events" -RemoteAddress <новый IP>`.
-> Проверка, что правило есть: `Get-NetFirewallRule -DisplayName "MAKCU UDP events"`.
+> **На этом ПК** пока действует правило 2026-10-12 только для `192.168.50.175`: скрипт с правами
+> администратора ещё не запускали. Если IP платы сменится, запустите скрипт. Сам адрес платы программы
+> находят сами: `--host auto`, `find_makcu.exe`, см. README эталона, раздел «Адрес платы и автопоиск».
 
 ## 1. Цель и итог
 

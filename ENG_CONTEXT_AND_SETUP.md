@@ -19,22 +19,17 @@ Entry point of the project. Current as of **2026-10-12**. Details are in the REA
 > **silently drops** these packets for any program that has no allow rule. Movement still works, but
 > buttons fall back to the 5 ms backup poll (`statsLine()` prints "СОБЫТИЯ НЕ ДОХОДЯТ", i.e. "EVENTS ARE NOT ARRIVING").
 >
-> **Once, in PowerShell as administrator**, pick one:
+> **Once:** run `basics/udp_way/perfect-transport-udp/setup_firewall.bat` (double click, UAC asks for rights).
+> It creates or replaces the rule "MAKCU UDP events": inbound UDP from the local subnet for any program, so
+> the board's IP is not needed. To check without rights: `.\setup_firewall.bat -Check` from that folder. The parameters and
+> the price of such a rule are at the top of the README in that folder.
 >
-> ```powershell
-> # allow inbound UDP only from the board, for any program (recommended; done on our machine 2026-10-12)
-> New-NetFirewallRule -DisplayName "MAKCU UDP events" -Direction Inbound -Protocol UDP -RemoteAddress 192.168.50.175 -Action Allow
-> ```
+> Instead of the rule you can mark the network as private (on our machine the Private firewall is off):
+> `Set-NetConnectionProfile -InterfaceAlias "Ethernet" -NetworkCategory Private`.
 >
-> or mark the network as private (on our machine the Private firewall is off):
->
-> ```powershell
-> Set-NetConnectionProfile -InterfaceAlias "Ethernet" -NetworkCategory Private
-> ```
->
-> **If the board's IP changes** (DHCP), the rule with `-RemoteAddress` has to be updated:
-> `Set-NetFirewallRule -DisplayName "MAKCU UDP events" -RemoteAddress <new IP>`.
-> To check the rule exists: `Get-NetFirewallRule -DisplayName "MAKCU UDP events"`.
+> **On this PC** the rule from 2026-10-12 for `192.168.50.175` only is still in force: the script has not
+> been run with administrator rights yet. If the board's IP changes, run the script. Programs find the
+> address itself: `--host auto`, `find_makcu.exe`, see the reference README, "The board's address and auto search".
 
 ## 1. Goal and result
 

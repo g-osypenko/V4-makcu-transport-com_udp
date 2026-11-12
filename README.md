@@ -16,6 +16,7 @@ Two single-header C++ transports that move the cursor through a **MAKCU** board 
 
 makcu::UdpBatchTransport tx;
 std::string err;
+// the board's IP differs per network: makcu_udp_discover.h finds it (makcu::resolveUdpHost)
 if (!tx.open("192.168.50.175", 8080, err)) { /* err = reason */ }
 
 // your timing thread, every 1 ms:

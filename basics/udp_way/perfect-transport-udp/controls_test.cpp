@@ -23,6 +23,7 @@
 //
 // Сборка: build_example.bat (собирает и пример, и этот тест).
 #include "makcu_udp_batch_transport.h"
+#include "makcu_udp_discover.h"
 
 #include <psapi.h>
 #include <timeapi.h>
@@ -690,7 +691,7 @@ bool runSoak(makcu::UdpBatchTransport& tx, int minutes) {
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCtrlHandler(onCtrl, TRUE);
-    std::string host = "192.168.50.175", mode;
+    std::string host = "auto", mode;
     double arg = 0.0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -705,12 +706,13 @@ int main(int argc, char** argv) {
         }
     }
     if (mode.empty()) {
-        std::printf("controls_test.exe [--host IP] --clicks | --draw S | --watch S | --locks S | --axes S | --reconnect S | --soak MINUTES\n");
+        std::printf("controls_test.exe [--host auto|IP|MAC] --clicks | --draw S | --watch S | --locks S | --axes S | --reconnect S | --soak MINUTES\n");
         return 2;
     }
     makcu::UdpBatchTransport tx;
     std::string err;
-    if (!tx.open(host, makcu::UdpBatchTransport::kDefaultPort, err)) {
+    const uint16_t port = makcu::UdpBatchTransport::kDefaultPort;
+    if (!makcu::resolveUdpHost(host, port, err) || !tx.open(host, port, err)) {
         std::printf("[-] %s\n", err.c_str());
         return 1;
     }
