@@ -30,6 +30,8 @@
 //     а не с 8080, поэтому сокет без connect();
 //   - инжект кнопок: press()/release() - SET 0x11..0x15, первым в цикле (раньше
 //     движения), без тайминга и "хуманизации" (время нажатия задаёт вызывающий);
+//   - чувствительность физической мыши (setSensitivity): доля движения руки в процентах,
+//     как DPI ниже; цикл переключает маску направлений 0x16 окнами не короче 6 мс;
 //   - блокировки физического ввода: setLock(), 14 целей (кнопки, оси, направления,
 //     колесо). Все направления движения уходят одной SET MOVE_MASK 0x16, колесо - одной
 //     SET WHEEL_MASK 0x17, кнопки - SET LOCK 0x60 (те же биты, что у 0x60). Блокировка
@@ -276,6 +278,8 @@ public:
         uint64_t snapshotLost = 0;     // снимков без ответа
         uint64_t repairs = 0;          // снимок разошёлся с отправленным - команды повторены
         uint64_t streamRestores = 0;   // поток событий оказался выключен - включён снова
+        int sensitivity = 100;         // чувствительность физической мыши, % (setSensitivity)
+        uint64_t sensToggles = 0;      // переключений маски чувствительности
         // Связь
         bool connected = false;
         uint64_t linkLost = 0;         // сколько раз связь терялась
@@ -370,6 +374,7 @@ public:
     void close() {
         if (ready_.load()) {
             closing_ = true;
+            sensPercent_.store(100, std::memory_order_release);  // маска чувствительности снимется вместе с блокировками
             if (connected_.load()) {
                 flushControls(300);  // отпустить кнопки, снять блокировки
                 if (streamRestore_) {
@@ -542,6 +547,26 @@ public:
     [[nodiscard]] uint16_t locks() const { return locksWanted_.load(); }
     [[nodiscard]] uint16_t locksOnBoard() const { return boardLocks_.load(); }
 
+    // ---- чувствительность физической мыши (любой поток, не блокирует) -------------------
+    // Сколько движения руки доходит до ПК, в процентах: 100 - всё (по умолчанию, выключено),
+    // 50 - как если бы DPI мыши стал вдвое ниже, 0 - рука курсор не двигает. Инжект (move())
+    // идёт целиком. Значение можно менять на ходу, держится до следующего вызова, close()
+    // возвращает 100. Тот же вызов, что в COM-эталоне, но по UDP грубее.
+    // Как сделано: плата умеет только пропустить отчёт мыши целиком или выбросить (маска
+    // направлений SET 0x16). Цикл ставит и снимает маску окнами в целое число мс, не короче
+    // kSensMinWindowMs (6 мс: после команды без ответа канал 3 мс занят, остальное - пакетам
+    // движения): 50 % - 6 мс идёт, 6 мс стоит; 25 % - 6 и 18; 75 % - 18 и 6; у остальных
+    // значений длинное окно меняется на 1 мс от периода к периоду, среднее равно заданному.
+    // Движение руки приходит порциями (при 50 % - 83 порции в секунду). Блокировки setLock()
+    // остаются и складываются с этой маской; locksOnBoard() показывает то, что стоит на плате,
+    // вместе с ней. Под маской physical() движение руки не считает (плата его не видит).
+    void setSensitivity(int percent) {
+        if (closing_.load()) return;
+        sensPercent_.store(std::min(std::max(percent, 0), 100), std::memory_order_release);
+        kick();
+    }
+    [[nodiscard]] int sensitivity() const { return sensPercent_.load(); }
+
     // ---- глубина очереди и остановка инжекта (любой поток) ------------------------------
     // Всё, что принято move() и ещё не ушло в USB (очередь транспорта, пакет в полёте,
     // очередь платы), выходит в ПК по одной записи на отчёт мыши (1 мс). Это отставание
@@ -679,6 +704,8 @@ public:
         s.snapshotLost = snapshotLost_.load();
         s.repairs = repairs_.load();
         s.streamRestores = streamRestores_.load();
+        s.sensitivity = sensPercent_.load();
+        s.sensToggles = sensToggles_.load();
         s.connected = connected_.load();
         s.linkLost = linkLost_.load();
         s.reconnects = reconnects_.load();
@@ -698,7 +725,7 @@ public:
 
     [[nodiscard]] std::string statsLine() const {
         const Stats s = stats();
-        char buf[2200];
+        char buf[2400];
         std::snprintf(buf, sizeof(buf),
             "batch 0x6C %s: записей %llu, пакетов %llu (%.2f/пакет), принято платой %llu | квитанций %llu, частичных %llu,"
             " отклонено %llu (X %llu), непонятных %llu | потеряно квитанций %llu, опросов %llu, поздних %llu"
@@ -709,6 +736,7 @@ public:
             " потеряно %llu, найдено опросом %llu, изменений %llu%s"
             " | инжект %02X (плата %02X), команд %llu | блокировки %04X (плата %04X), команд %llu"
             " | снимков %llu (потеряно %llu), исправлено %llu, поток событий включён заново %llu"
+            " | чувствительность %d %%, переключений маски %llu"
             " | связь %s: обрывов %llu, переподключений %llu, посл. обрыв %.0f мс, сброшено записей %llu"
             " | физика %s: опросов 0x63 %llu, ответов %llu, потеряно %llu, перецентровок %llu, у края %llu",
             endpoint_.c_str(), u(s.records), u(s.packets),
@@ -721,7 +749,8 @@ public:
             u(s.buttonOverflows), u(s.buttonPolls), u(s.buttonReplies), u(s.buttonLost), u(s.buttonMissed),
             u(s.buttonChanges), s.eventsMissing ? " | СОБЫТИЯ НЕ ДОХОДЯТ (брандмауэр?) - опрос 5 мс" : "",
             s.injectWanted, s.injectOnBoard, u(s.buttonCommands), s.locksWanted, s.locksOnBoard, u(s.lockCommands),
-            u(s.snapshots), u(s.snapshotLost), u(s.repairs), u(s.streamRestores), s.connected ? "есть" : "НЕТ",
+            u(s.snapshots), u(s.snapshotLost), u(s.repairs), u(s.streamRestores), s.sensitivity, u(s.sensToggles),
+            s.connected ? "есть" : "НЕТ",
             u(s.linkLost), u(s.reconnects), s.lastOutageMs, u(s.droppedRecords), s.tracking ? "вкл" : "выкл",
             u(s.posPolls), u(s.posReplies), u(s.posLost), u(s.recentres), u(s.clamped));
         return buf;
@@ -749,6 +778,9 @@ private:
     static constexpr uint16_t kLockSendable = 0x1F | 1u << 6 | 1u << 7 | 1u << 9 | 1u << 10 | 1u << 12 | 1u << 13;
     static constexpr uint16_t kLockMoveDirs = 1u << 6 | 1u << 7 | 1u << 9 | 1u << 10;  // +X -X +Y -Y: одна 0x16
     static constexpr uint16_t kLockWheelDirs = 1u << 12 | 1u << 13;                    // wheel+ wheel-: одна 0x17
+    // Маска чувствительности: окно пропуска и окно маски не короче стольких мс. Команда 0x16 занимает
+    // канал на kNoReplyGapUs (3 мс); замер 2026-11-12: при периоде 12 мс инжект рядом идёт, при 8 мс - встаёт.
+    static constexpr double kSensMinWindowMs = 6.0;
 
     static unsigned long long u(uint64_t v) { return static_cast<unsigned long long>(v); }
     static constexpr DWORD kTimerHighResolution = 0x00000002;  // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+)
@@ -1101,6 +1133,7 @@ private:
     bool pumpLocked() {
         if (!ready_.load() || failed_.load() || !connected_.load()) return false;
         const int64_t now = detail::Qpc::now();
+        sensLocked(now);
         if (const uint64_t a = awaitSeq_.load(std::memory_order_acquire); a != 0) {
             const int64_t waited = now - awaitT_.load(std::memory_order_relaxed);
             if (a == posSeq_.load(std::memory_order_acquire)) {
@@ -1281,7 +1314,39 @@ private:
     // отправленного. Кнопки раньше блокировок; из блокировок первыми направления движения -
     // все четыре одной 0x16, затем колесо одной 0x17, затем кнопки по одной 0x60.
     // После команды - пауза и сверка снимком.
+    // Под sendMutex_: рисунок маски чувствительности (setSensitivity). Здесь только расписание:
+    // какое окно идёт сейчас. Саму команду 0x16 отправит sendControlLocked(), когда канал свободен.
+    // Окна в целых мс: короткое - kSensMinWindowMs, длинное - с переносом дробной части (sensAcc_).
+    void sensLocked(int64_t now) {
+        const int pct = sensPercent_.load(std::memory_order_acquire);
+        if (pct != sensApplied_) {  // новое значение: рисунок с начала
+            sensApplied_ = pct;
+            sensAcc_ = 0.0;
+            sensPending_ = false;
+            if (pct <= 0 || pct >= 100) {
+                sensEdgeT_ = 0;
+                sensBlock_ = pct <= 0;
+                verifyDue_ = true;  // постоянное состояние - со снимком-проверкой
+                return;
+            }
+            sensBlock_ = true;  // первым пойдёт окно пропуска
+            sensEdgeT_ = now;
+        }
+        if (!sensEdgeT_ || now < sensEdgeT_) return;
+        if (now - sensEdgeT_ > detail::Qpc::fromUs(20000.0)) sensEdgeT_ = now;  // отстали (обрыв, заминка): заново отсюда
+        const bool block = !sensBlock_;
+        const double p = pct / 100.0, shortMs = kSensMinWindowMs;
+        const double lenMs = block ? (p <= 0.5 ? shortMs * (1.0 - p) / p : shortMs) : (p <= 0.5 ? shortMs : shortMs * p / (1.0 - p));
+        sensAcc_ += lenMs;
+        const double whole = std::floor(sensAcc_ + 1e-9);
+        sensAcc_ -= whole;
+        sensEdgeT_ += detail::Qpc::fromUs(whole * 1000.0);
+        sensBlock_ = block;
+        sensPending_ = true;
+    }
+
     bool sendControlLocked(int64_t now) {
+        bool verify = true;
         const uint8_t wantB = static_cast<uint8_t>(injectWanted_.load(std::memory_order_acquire) & 0x1F);
         if (const uint8_t diff = static_cast<uint8_t>(wantB ^ sentButtons_); diff) {
             uint8_t i = 0;
@@ -1291,14 +1356,25 @@ private:
             sentButtons_ = static_cast<uint8_t>(sentButtons_ ^ (1u << i));
             buttonCommands_.fetch_add(1, std::memory_order_relaxed);
         } else {
-            const uint16_t wantL = locksWanted_.load(std::memory_order_acquire);
+            uint16_t wantL = locksWanted_.load(std::memory_order_acquire);
+            if (sensBlock_) wantL = normalizeLocks(static_cast<uint16_t>(wantL | kLockMoveDirs));
             const uint16_t diffL = static_cast<uint16_t>((wantL ^ sentLocks_) & kLockSendable);
-            if (!diffL) return false;
+            if (!diffL) {
+                sensPending_ = false;
+                return false;
+            }
             auto bit = [wantL](int i) { return static_cast<uint8_t>((wantL >> i) & 1u); };
             if (diffL & kLockMoveDirs) {
                 const uint8_t pl[4] = {bit(7), bit(6), bit(9), bit(10)};  // left=-X right=+X down=+Y up=-Y
                 if (!sendFrameLocked(++seq_, kOpMoveMask, pl, 4)) return false;
                 sentLocks_ = normalizeLocks(static_cast<uint16_t>((sentLocks_ & ~kLockMoveDirs) | (wantL & kLockMoveDirs)));
+                if (sensPending_) {
+                    // Переключение маски чувствительности: без снимка, иначе после каждого - ещё ~2 мс
+                    // канала. Маску сверяет пульс-снимок.
+                    sensPending_ = false;
+                    verify = false;
+                    sensToggles_.fetch_add(1, std::memory_order_relaxed);
+                }
             } else if (diffL & kLockWheelDirs) {
                 const uint8_t pl[2] = {bit(13), bit(12)};  // down=wheel- up=wheel+
                 if (!sendFrameLocked(++seq_, kOpWheelMask, pl, 2)) return false;
@@ -1313,7 +1389,7 @@ private:
             lockCommands_.fetch_add(1, std::memory_order_relaxed);
         }
         ++ctlEpoch_;
-        verifyDue_ = true;
+        if (verify) verifyDue_ = true;
         gapUntil_ = now + detail::Qpc::fromUs(kNoReplyGapUs);
         return true;
     }
@@ -1447,6 +1523,13 @@ private:
     void resetControls() {
         injectWanted_ = 0;
         locksWanted_ = 0;
+        sensPercent_ = 100;
+        sensToggles_ = 0;
+        sensEdgeT_ = 0;
+        sensApplied_ = 100;
+        sensBlock_ = false;
+        sensPending_ = false;
+        sensAcc_ = 0.0;
         boardButtons_ = 0;
         boardLocks_ = 0;
         sentButtons_ = 0;
@@ -1711,6 +1794,14 @@ private:
     std::atomic<uint8_t> boardButtons_{0};
     std::atomic<uint16_t> boardLocks_{0};
     std::atomic<bool> snapFresh_{false};
+    // Чувствительность физической мыши (setSensitivity): рисунок ведёт цикл под sendMutex_.
+    std::atomic<int> sensPercent_{100};  // запрошено, %
+    std::atomic<uint64_t> sensToggles_{0};
+    int64_t sensEdgeT_ = 0;      // под sendMutex_: QPC следующего фронта маски (0 - переключения нет)
+    int sensApplied_ = 100;      // под sendMutex_: значение, по которому идёт рисунок
+    bool sensBlock_ = false;     // под sendMutex_: сейчас окно маски
+    bool sensPending_ = false;   // под sendMutex_: окно сменилось, команда 0x16 ещё не ушла
+    double sensAcc_ = 0.0;       // под sendMutex_: перенос дробной части длинного окна, мс
     uint8_t sentButtons_ = 0;    // под sendMutex_
     uint16_t sentLocks_ = 0;     // под sendMutex_ (нормальная форма)
     uint64_t ctlEpoch_ = 0;                // под sendMutex_: номер последней команды кнопки/блокировки

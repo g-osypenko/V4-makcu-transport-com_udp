@@ -261,7 +261,7 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     Args a;
     auto usage = [] {
-        std::printf("track_test_com.exe [--port COM5] --accuracy S | --lock N | --lockloss S | --inject N | --reflock N | --track S | --trackinject N\n");
+        std::printf("track_test_com.exe [--port COM5] --accuracy S | --lock N | --lockloss S | --inject N | --reflock N | --track S | --trackinject N | --pwm N [--duty %%,..] [--pwmperiod US,..] [--oneway | --both] [--seg MS] | --assist N [--duty %%] [--pwmperiod US,..] | --sens N [--duty %%,..] [--seg MS]\n");
         return 2;
     };
     bool state = false;

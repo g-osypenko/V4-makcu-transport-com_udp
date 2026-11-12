@@ -24,6 +24,8 @@
 //   - инжект кнопок: press()/release() - SET 0x11..0x15 сразу из вызывающего потока,
 //     без очереди за движением, без тайминга и "хуманизации" (время нажатия задаёт
 //     вызывающий);
+//   - чувствительность физической мыши (setSensitivity): доля движения руки в процентах,
+//     как DPI ниже; сторож переключает маску направлений 0x16 окнами в целые мс;
 //   - блокировки физического ввода: setLock(), 14 целей (кнопки, оси, направления,
 //     колесо). Все направления движения уходят одной SET MOVE_MASK 0x16, колесо - одной
 //     SET WHEEL_MASK 0x17, кнопки - SET LOCK 0x60 (те же биты, что у 0x60). Блокировка
@@ -268,6 +270,8 @@ public:
         uint64_t snapshotLost = 0;    // снимков без ответа
         uint64_t repairs = 0;         // снимок разошёлся с отправленным - команды повторены
         uint64_t streamRestores = 0;  // поток событий оказался выключен - включён снова
+        int sensitivity = 100;        // чувствительность физической мыши, % (setSensitivity)
+        uint64_t sensToggles = 0;     // переключений маски чувствительности
         // Связь
         bool connected = false;
         uint64_t linkLost = 0;        // сколько раз связь терялась
@@ -330,6 +334,14 @@ public:
         closing_ = true;
         stopWatch_ = true;
         if (watchdog_.joinable()) watchdog_.join();
+        sensPercent_.store(100, std::memory_order_release);
+        sensEdgeT_.store(0, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(sendMutex_);
+            sensApplied_ = 100;
+            sensBlock_ = false;  // маска чувствительности снимется вместе с блокировками
+            verifyDue_ = true;
+        }
         if (ready_.load() && connected_.load()) {
             flushControls(300);  // отпустить кнопки, снять блокировки
             if (streamRestore_) {
@@ -497,6 +509,26 @@ public:
     [[nodiscard]] uint16_t locks() const { return locksWanted_.load(); }
     [[nodiscard]] uint16_t locksOnBoard() const { return boardLocks_.load(); }
 
+    // ---- чувствительность физической мыши (любой поток, не блокирует) -------------------
+    // Сколько движения руки доходит до ПК, в процентах: 100 - всё (по умолчанию, выключено),
+    // 50 - как если бы DPI мыши стал вдвое ниже, 0 - рука курсор не двигает. Инжект (move())
+    // идёт целиком. Значение можно менять на ходу сколько угодно раз, действует не позже чем
+    // через 2 мс и держится до следующего вызова, close() возвращает 100.
+    // Как сделано: плата умеет только пропустить отчёт мыши целиком или выбросить (маска
+    // направлений SET 0x16), масштаба у неё нет. Сторож ставит и снимает маску окнами в целое
+    // число мс, не короче 2 мс (отчёты мыши идут раз в 1 мс, окно короче захватывает то один
+    // отчёт, то ни одного): 50 % - 2 мс идёт, 2 мс стоит; 25 % - 2 и 6; 75 % - 6 и 2. У
+    // остальных значений длинное окно меняется на 1 мс от периода к периоду, так что среднее
+    // равно заданному. Движение руки приходит порциями (при 50 % - 250 порций в секунду), путь
+    // за время от десятков мс равен доле. Блокировки setLock() остаются и складываются с этой
+    // маской; locksOnBoard() показывает то, что стоит на плате, вместе с ней. Под маской
+    // physical() движение руки не считает (плата его не видит).
+    void setSensitivity(int percent) {
+        if (closing_.load()) return;
+        sensPercent_.store(std::min(std::max(percent, 0), 100), std::memory_order_release);
+    }
+    [[nodiscard]] int sensitivity() const { return sensPercent_.load(); }
+
     // ---- глубина очереди и остановка инжекта (любой поток) ------------------------------
     // Всё, что принято move() и ещё не ушло в USB, выходит в ПК по одной записи на отчёт мыши
     // (1 мс). Это отставание курсора от вызова и хвост после остановки. Часы платы отстают от
@@ -604,6 +636,8 @@ public:
         s.snapshotLost = snapshotLost_.load();
         s.repairs = repairs_.load();
         s.streamRestores = streamRestores_.load();
+        s.sensitivity = sensPercent_.load();
+        s.sensToggles = sensToggles_.load();
         s.connected = connected_.load();
         s.linkLost = linkLost_.load();
         s.reconnects = reconnects_.load();
@@ -627,7 +661,7 @@ public:
 
     [[nodiscard]] std::string statsLine() const {
         const Stats s = stats();
-        char buf[1800];
+        char buf[2000];
         std::snprintf(buf, sizeof(buf),
             "raw 0x69: отправлено %llu | принято в FIFO %llu | отдано в USB-endpoint %llu | отказ %llu"
             " | немедл. ошибок %llu (нет места %llu) | ack %llu, повторов %llu | окно %u, max живых %u"
@@ -637,6 +671,7 @@ public:
             " | кнопки %02X: событий %llu, переполнений %llu, опросов %llu, ответов %llu, изменений %llu"
             " | инжект %02X (плата %02X), команд %llu | блокировки %04X (плата %04X), команд %llu"
             " | снимков %llu (потеряно %llu), исправлено %llu, поток событий включён заново %llu"
+            " | чувствительность %d %%, переключений маски %llu"
             " | связь %s: обрывов %llu, переподключений %llu, посл. обрыв %.0f мс, сброшено записей %llu"
             " | физика %s: опросов 0x63 %llu, ответов %llu, потеряно %llu, перецентровок %llu, у края %llu",
             u(s.submitted), u(s.accepted), u(s.endpointOk), u(s.rejected), u(s.immediate), u(s.noCapacity),
@@ -646,7 +681,7 @@ public:
             s.maxCallUs, u(s.errors), s.buttons, u(s.buttonEvents), u(s.buttonOverflows), u(s.buttonPolls),
             u(s.buttonReplies), u(s.buttonChanges), s.injectWanted, s.injectOnBoard, u(s.buttonCommands),
             s.locksWanted, s.locksOnBoard, u(s.lockCommands), u(s.snapshots), u(s.snapshotLost), u(s.repairs),
-            u(s.streamRestores), s.connected ? "есть" : "НЕТ", u(s.linkLost), u(s.reconnects), s.lastOutageMs,
+            u(s.streamRestores), s.sensitivity, u(s.sensToggles), s.connected ? "есть" : "НЕТ", u(s.linkLost), u(s.reconnects), s.lastOutageMs,
             u(s.droppedRecords), s.tracking ? "вкл" : "выкл", u(s.posPolls), u(s.posReplies), u(s.posLost),
             u(s.recentres), u(s.clamped));
         return buf;
@@ -680,6 +715,10 @@ private:
     static constexpr uint16_t kLockSendable = 0x1F | 1u << 6 | 1u << 7 | 1u << 9 | 1u << 10 | 1u << 12 | 1u << 13;
     static constexpr uint16_t kLockMoveDirs = 1u << 6 | 1u << 7 | 1u << 9 | 1u << 10;  // +X -X +Y -Y: одна 0x16
     static constexpr uint16_t kLockWheelDirs = 1u << 12 | 1u << 13;                    // wheel+ wheel-: одна 0x17
+    // Маска чувствительности: окно пропуска и окно маски не короче стольких мс (замер 2026-11-12:
+    // окна 2 мс и длиннее дают долю точно, 0.5-1 мс - нет); сторож ждёт фронт вращением последние kSensSpinUs.
+    static constexpr double kSensMinWindowMs = 2.0;
+    static constexpr double kSensSpinUs = 300.0;
     // Снимков в ожидании ответа не больше стольких (кольцо эпох).
     static constexpr uint32_t kSnapRing = 16;
     static constexpr uint32_t kSnapMaxOutstanding = 12;
@@ -837,17 +876,32 @@ private:
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, kTimerHighResolution, TIMER_ALL_ACCESS);
         if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);  // старая Windows: грубее
         LARGE_INTEGER due{};
-        int64_t nextTry = 0;
+        int64_t nextTry = 0, nextTick = 0;
         while (!stopWatch_.load()) {
             const bool fast = trackOn_.load(std::memory_order_acquire);
-            if (timer) {
-                due.QuadPart = fast ? -static_cast<LONGLONG>(kTrackPollUs * 10.0) : -20000;  // единицы 100 нс
-                SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
-                WaitForSingleObject(timer, 50);
-            } else {
-                Sleep(fast ? 1 : 2);
+            const double tickUs = fast ? kTrackPollUs : 2000.0;
+            // Маска чувствительности: проснуться чуть раньше фронта и дождаться его вращением -
+            // окно должно накрывать целое число отчётов мыши.
+            const int64_t edge = sensEdgeT_.load(std::memory_order_acquire);
+            double waitUs = tickUs;
+            if (edge) {
+                // Фронт просрочен больше чем на 1 мс (связи нет) - обычный тик, без вращения.
+                const double toEdge = detail::Qpc::toUs(edge - detail::Qpc::now());
+                if (toEdge > -1000.0) waitUs = std::min(waitUs, std::max(toEdge - kSensSpinUs, 0.0));
+            }
+            if (waitUs >= 50.0) {
+                if (timer) {
+                    due.QuadPart = -static_cast<LONGLONG>(waitUs * 10.0);  // единицы 100 нс
+                    SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+                    WaitForSingleObject(timer, 50);
+                } else {
+                    Sleep(fast ? 1 : 2);
+                }
             }
             if (stopWatch_.load() || closing_.load()) break;
+            if (edge && detail::Qpc::toUs(edge - detail::Qpc::now()) <= kSensSpinUs) {
+                while (detail::Qpc::now() < edge && !stopWatch_.load()) YieldProcessor();
+            }
             const int64_t now = detail::Qpc::now();
             if (connected_.load()) {
                 if (ioError_.load() || now - lastRxT_.load(std::memory_order_acquire) > detail::Qpc::fromUs(kLinkLostUs)) {
@@ -859,11 +913,15 @@ private:
                 // Пока вызывающий шлёт, снимки, квитанции и перенос идут из его потока, вплотную к
                 // записи движения (рисунок записей ревизии 3). Сторож подхватывает, когда он замолчал.
                 if (linkUpLocked()) {
-                    if (now - rawLastMoveT_.load(std::memory_order_acquire) > detail::Qpc::fromUs(kRawCallerIdleUs)) {
-                        serviceLocked(now);
-                        (void)moveRaw(0, 0, true);
+                    sensLocked(now);
+                    if (now >= nextTick) {  // обычный тик сторожа; фронты маски будят чаще
+                        nextTick = now + detail::Qpc::fromUs(tickUs * 0.75);
+                        if (now - rawLastMoveT_.load(std::memory_order_acquire) > detail::Qpc::fromUs(kRawCallerIdleUs)) {
+                            serviceLocked(now);
+                            (void)moveRaw(0, 0, true);
+                        }
+                        trackLocked(now);
                     }
-                    trackLocked(now);
                 }
                 continue;
             }
@@ -1009,15 +1067,50 @@ private:
         }
     }
 
+    // Под sendMutex_, только сторож: рисунок маски чувствительности (setSensitivity). Фронт
+    // наступил - переключить маску и назначить следующий. Окна в целых мс: короткое -
+    // kSensMinWindowMs, длинное - с переносом дробной части (sensAcc_), среднее равно доле.
+    void sensLocked(int64_t now) {
+        const int pct = sensPercent_.load(std::memory_order_acquire);
+        if (pct != sensApplied_) {  // новое значение: рисунок с начала
+            sensApplied_ = pct;
+            sensAcc_ = 0.0;
+            if (pct <= 0 || pct >= 100) {
+                sensEdgeT_.store(0, std::memory_order_release);
+                sensBlock_ = pct <= 0;
+                (void)sendControlsLocked(now);  // со снимком-проверкой; не ушло - дошлёт serviceLocked
+                return;
+            }
+            sensBlock_ = true;  // первым пойдёт окно пропуска
+            sensEdgeT_.store(now, std::memory_order_release);
+        }
+        int64_t edge = sensEdgeT_.load(std::memory_order_acquire);
+        if (!edge || now < edge) return;
+        if (now - edge > detail::Qpc::fromUs(20000.0)) edge = now;  // отстали (обрыв, заминка): заново отсюда
+        const bool block = !sensBlock_;
+        const double p = pct / 100.0, shortMs = kSensMinWindowMs;
+        const double lenMs = block ? (p <= 0.5 ? shortMs * (1.0 - p) / p : shortMs) : (p <= 0.5 ? shortMs : shortMs * p / (1.0 - p));
+        sensAcc_ += lenMs;
+        const double whole = std::floor(sensAcc_ + 1e-9);
+        sensAcc_ -= whole;
+        sensEdgeT_.store(edge + detail::Qpc::fromUs(whole * 1000.0), std::memory_order_release);
+        sensBlock_ = block;
+        if (sendControlsLocked(now, false)) sensToggles_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // Под sendMutex_: все различия запрошенного и отправленного - одной записью: кнопки,
     // все направления движения одной 0x16, колесо одной 0x17, кнопки-блокировки по одной 0x60,
     // в конце снимок 0x56 для проверки. Пауза после команд по COM не нужна.
-    bool sendControlsLocked(int64_t now) {
+    // verify = false (переключение маски чувствительности): без снимка, иначе при 500 фронтах
+    // в секунду столько же снимков; маску сверяет пульс-снимок.
+    bool sendControlsLocked(int64_t now, bool verify = true) {
         const uint8_t wantB = static_cast<uint8_t>(injectWanted_.load(std::memory_order_acquire) & 0x1F);
-        const uint16_t wantL = locksWanted_.load(std::memory_order_acquire);
+        uint16_t wantL = locksWanted_.load(std::memory_order_acquire);
+        if (sensBlock_) wantL = normalizeLocks(static_cast<uint16_t>(wantL | kLockMoveDirs));
         const uint8_t diffB = static_cast<uint8_t>(wantB ^ sentButtons_);
         const uint16_t diffL = static_cast<uint16_t>((wantL ^ sentLocks_) & kLockSendable);
         if (!diffB && !diffL) return false;
+        if (diffB || (diffL & ~kLockMoveDirs)) verify = true;  // кнопки и прочие блокировки - всегда со снимком
         std::array<uint8_t, kFrameMax> buf{};
         size_t len = 0;
         uint32_t nb = 0, nl = 0;
@@ -1051,7 +1144,7 @@ private:
         }
         // 5 кнопок x 6 + 0x16 9 + 0x17 7 + 5 блокировок x 7 + снимок 5 = 86 <= kFrameMax.
         ++ctlEpoch_;
-        if (!sendSnapshotLocked(now, buf.data(), len)) {
+        if (!(verify ? sendSnapshotLocked(now, buf.data(), len) : sendFrame(buf.data(), len))) {
             --ctlEpoch_;
             return false;  // кольцо занято: повтор на следующем тике (move()/сторож)
         }
@@ -1795,6 +1888,12 @@ private:
     void resetControls() {
         injectWanted_ = 0;
         locksWanted_ = 0;
+        sensPercent_ = 100;
+        sensEdgeT_ = 0;
+        sensApplied_ = 100;
+        sensBlock_ = false;
+        sensAcc_ = 0.0;
+        sensToggles_ = 0;
         boardButtons_ = 0;
         boardLocks_ = 0;
         snapReq_ = 0;
@@ -2010,6 +2109,13 @@ private:
     std::atomic<uint8_t> boardButtons_{0};
     std::atomic<uint16_t> boardLocks_{0};
     std::atomic<bool> snapFresh_{false};
+    // Чувствительность физической мыши (setSensitivity): рисунок ведёт сторож.
+    std::atomic<int> sensPercent_{100};    // запрошено, %
+    std::atomic<int64_t> sensEdgeT_{0};    // QPC следующего фронта маски (0 - переключения нет)
+    std::atomic<uint64_t> sensToggles_{0};
+    int sensApplied_ = 100;     // под sendMutex_: значение, по которому идёт рисунок
+    bool sensBlock_ = false;    // под sendMutex_: сейчас окно маски
+    double sensAcc_ = 0.0;      // под sendMutex_: перенос дробной части длинного окна, мс
     uint8_t sentButtons_ = 0;   // под sendMutex_
     uint16_t sentLocks_ = 0;    // под sendMutex_ (нормальная форма)
     uint64_t ctlEpoch_ = 0;     // под sendMutex_: номер последней записи с командами

@@ -20,6 +20,7 @@
 //                  в Windows. Мышь не трогать.
 //                  --period US: тик круга (меньше 1000 - очередь набирается быстрее).
 //                  --busy: на ходу клик левой раз в 2 с (+1 с) и блокировка X+Y на 0.5 с раз в 10 с (+5 с).
+//                  --withsens %: весь прогон держать tx.setSensitivity(%) (инжект от него не зависит).
 //                  --mark: последняя запись - метка +600 по X, хвост считается до неё: так он
 //                  виден и с рукой на мыши (без руки мышь не трогать).
 //   --reflock N    N раз блокировка через эталон, 400 мс, снять; через раз tx.setLock(X) +
@@ -30,6 +31,24 @@
 //                  обе оси блокируются на 0.4 с. tx.physical() против Raw Input.
 //   --trackinject N  слежение + N всплесков инжекта по 1 с (мышь не трогать): physical()
 //                  должен остаться 0,0; через сколько слежение снова идёт.
+//   --pwm N        [--duty %,%..] [--pwmperiod US,US..] [--oneway] частичный пропуск физики: маска X
+//                  (SET 0x16) переключается с периодом US мкс, доля пропуска %. N отрезков по 1 с на
+//                  каждую пару, между ними 0.5 с свободно. Ось Y свободна и служит мерой: фактическая
+//                  доля = (путь X / путь Y) под переключением : то же на свободе. --oneway: маска
+//                  только на +X (вправо), мера - путь вправо / путь влево. --both: маска на обеих
+//                  осях, как в работе; мера - доля сообщений Raw Input с движением (под маской
+//                  отчёты идут, но пустые).
+//                  --seg MS: длина отрезка (по умолчанию 1000). Окно показывает текущую долю и
+//                  период. Руку плата не читает. Всё время водите мышью кругами.
+//   --assist N     [--duty %] [--pwmperiod US,US..] N попыток: в окне красный круг, инжект через эталон
+//                  тянет курсор к точке в 30-45 пикс. от его центра, рука доводит в круг и держит
+//                  0.25 с. Варианты по очереди: без маски и с переключением маски X+Y через
+//                  tx.setLocks() (доля --duty, по умолчанию 50; периоды --pwmperiod, по умолчанию
+//                  16000). Считает, сколько команд маски эталон отправил рядом с инжектом, долю руки
+//                  после инжекта, время доведения. Доводите курсор рукой в круг.
+//   --sens N       [--duty %,%..] [--seg MS] чувствительность через эталон: tx.setSensitivity(%) на
+//                  отрезок (по умолчанию 100,75,50,33,25,10 и 1000 мс), между отрезками 100 %. N кругов.
+//                  Фактическая доля - по сообщениям Raw Input с движением. Водите мышью кругами.
 //
 // Тестовое окно должно быть в фокусе: Raw Input фонового окна Windows 11 прореживает.
 // Курсор заперт в окне. Esc - выход; блокировки снимаются и проверяются снимком 0x56.
@@ -45,6 +64,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -63,6 +83,24 @@ bool g_busy = false;                  // --busy: клики и блокиров�
 bool g_mark = false;                  // --mark: последняя запись - метка, хвост до неё
 constexpr int kMarkDx = 600;          //   больше любого отчёта руки
 double g_tickUs = 1000.0;             // --period US: тик круга в --inject (меньше 1000 - очередь набирается быстрее)
+std::vector<int> g_pwmDuty;           // --duty %,%..: доля пропуска в --pwm (пусто - 50)
+std::vector<int> g_pwmPeriodUs;       // --pwmperiod US,US..: период переключения маски в --pwm (пусто - 2000)
+bool g_pwmOneWay = false;             // --oneway: в --pwm маска только на +X
+bool g_pwmBoth = false;               // --both: в --pwm маска на обеих осях (мера - доля сообщений с движением)
+double g_pwmSegMs = 1000.0;           // --seg MS: длина отрезка под переключением в --pwm
+
+// Есть ли у эталона setSensitivity() (в UDP-эталоне пока нет).
+template <class Tx, class = void>
+struct HasSens : std::false_type {};
+template <class Tx>
+struct HasSens<Tx, std::void_t<decltype(std::declval<Tx&>().setSensitivity(0))>> : std::true_type {};
+int g_withSens = 100;  // --withsens %: в --inject держать tx.setSensitivity(%) весь прогон
+
+template <class Tx>
+void applySens(Tx& tx, int pct) {
+    if constexpr (HasSens<Tx>::value) tx.setSensitivity(pct);
+    else (void)tx, (void)pct;
+}
 
 BOOL WINAPI onCtrl(DWORD type) {
     g_stop = true;
@@ -91,9 +129,11 @@ struct Ui {
     std::atomic<const wchar_t*> small{L""};
     std::atomic<double> rate{0.0};
     std::atomic<uint32_t> polls{0};
+    std::atomic<int> tgtX{-1}, tgtY{-1};  // --assist: цель в координатах клиента (-1 - нет)
 };
 Ui g_ui;
 HFONT g_bigFont = nullptr;
+constexpr int kTgtR = 14;  // радиус круга цели, пикс.
 
 bool foreground() { return GetForegroundWindow() == g_ui.hwnd; }
 
@@ -115,6 +155,20 @@ void drawStatus(HDC dc, HWND h) {
     DrawTextW(dc, b, -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SetTextColor(dc, oc);
     SelectObject(dc, old);
+    const int tx = g_ui.tgtX.load(), ty = g_ui.tgtY.load();
+    if (tx >= 0) {
+        HPEN pen = CreatePen(PS_SOLID, 3, RGB(220, 0, 0));
+        HGDIOBJ op = SelectObject(dc, pen);
+        HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Ellipse(dc, tx - kTgtR, ty - kTgtR, tx + kTgtR + 1, ty + kTgtR + 1);
+        MoveToEx(dc, tx - 4, ty, nullptr);
+        LineTo(dc, tx + 5, ty);
+        MoveToEx(dc, tx, ty - 4, nullptr);
+        LineTo(dc, tx, ty + 5);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(pen);
+    }
 }
 
 LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
@@ -818,6 +872,11 @@ int runInject(int trials) {
         return 1;
     }
     std::printf("[+] эталон: %s%s\n", tx.info().c_str(), g_stopCall ? " | в конце stopMovement()" : "");
+    if (g_withSens < 100) {
+        applySens(tx, g_withSens);
+        std::printf("[+] чувствительность физической мыши %d %% на весь прогон%s\n", g_withSens,
+            HasSens<typename T::Tx>::value ? "" : " - НЕТ: в этом эталоне setSensitivity() нет");
+    }
     say(g_mark && !g_busy ? L"ВОДИТЕ МЫШЬЮ КРУГАМИ, НЕ ОСТАНАВЛИВАЯСЬ" : L"НЕ ТРОГАЙТЕ МЫШЬ", L"курсор будет описывать круги");
     sleepMs(1500.0);
     std::printf("maxLag | длит., мс | отправлено X,Y | Windows X,Y | первый отчёт, мс | хвост после %s: мс / отчётов | "
@@ -1212,12 +1271,606 @@ int runTrackInject(int trials) {
     return 0;
 }
 
+// ---- --pwm: доля физического движения быстрым переключением маски --------------------------
+// Маска направления (SET 0x16) умеет только "пропустить" или "выбросить" отчёт целиком. Если
+// переключать её каждые 1-4 мс, до Windows доходит часть отчётов: чувствительность руки падает
+// до доли пропуска. Читать руку для этого не нужно (ни 0x63, ни инжекта). Маска ставится только
+// на X, ось Y свободна и служит мерой: рука водит кругами, путь по X и по Y на свободе относится
+// как base; под переключением отношение падает до base * доля. С --oneway маска только на +X,
+// мера - путь вправо к пути влево.
+struct PwmSeg {
+    int duty = 0, periodUs = 0;
+    int64_t t0 = 0, t1 = 0;  // начало первого периода и команда снятия
+    uint32_t cmds = 0;
+    double lateMaxUs = 0.0;  // на сколько команда ушла позже расписания (ПК)
+};
+
+struct PwmSum {
+    int64_t num = 0, den = 0;  // путь под маской и путь-мера
+    size_t msgs = 0, gaps = 0, oneMs = 0;
+    double maxGapMs = 0.0;
+    double ratio() const { return den ? static_cast<double>(num) / static_cast<double>(den) : 0.0; }
+};
+
+// Сообщения Raw Input в [a, z): путь под маской и путь-мера, ровность потока отчётов.
+inline void pwmAdd(PwmSum& s, const Track& tr, int64_t a, int64_t z) {
+    const size_t i0 = tr.upto(a), i1 = tr.upto(z);
+    for (size_t i = i0; i < i1; ++i) {
+        if (g_pwmBoth) {
+            // Под маской отчёты идут каждую мс, но пустые: доля = сообщения с движением / все сообщения.
+            s.num += (tr.dx[i] || tr.dy[i]) ? 1 : 0;
+            ++s.den;
+        } else if (g_pwmOneWay) {
+            s.num += std::max(tr.dx[i], 0);
+            s.den += std::max(-tr.dx[i], 0);
+        } else {
+            s.num += std::abs(tr.dx[i]);
+            s.den += std::abs(tr.dy[i]);
+        }
+        ++s.msgs;
+        if (i > i0) {
+            const double us = Q::toUs(tr.t[i] - tr.t[i - 1]);
+            if (us < 20000.0) {
+                ++s.gaps;
+                if (us >= 500.0 && us < 1500.0) ++s.oneMs;
+            }
+            s.maxGapMs = std::max(s.maxGapMs, us / 1000.0);
+        }
+    }
+}
+
+template <class Board>
+int runPwm(Board& b, int rounds) {
+    if (!b.unlockAll()) {
+        std::printf("[-] не удалось снять блокировки перед тестом\n");
+        return 1;
+    }
+    if (g_pwmDuty.empty()) g_pwmDuty.push_back(50);
+    if (g_pwmPeriodUs.empty()) g_pwmPeriodUs.push_back(2000);
+    static const wchar_t* const kPwmHint =
+        L"водите кругами, не останавливаясь: курсор будет идти медленнее или вставать, это замер";
+    static const wchar_t* const kPwmFree = L"СВОБОДНО - ВОДИТЕ КРУГАМИ";
+    say(kPwmFree, kPwmHint);
+    sleepMs(1500.0);
+    auto mask = [&](bool on) {
+        const uint8_t s = on ? 1 : 0;
+        const uint8_t y = g_pwmBoth ? s : 0;
+        const uint8_t pl[4] = {static_cast<uint8_t>(g_pwmOneWay ? 0 : s), s, y, y};  // left right down up
+        return b.noReply(0x16, pl, 4);
+    };
+    // Надписи окна живут до конца прогона: say() хранит указатель.
+    static std::vector<std::wstring> labels;
+    labels.clear();
+    labels.reserve(static_cast<size_t>(rounds) * g_pwmDuty.size() * g_pwmPeriodUs.size() + 1);
+    std::vector<PwmSeg> segs;
+    const int64_t tStart = Q::now();
+    bool stuck = false;
+    for (int r = 0; r < rounds && !g_stop.load() && !stuck; ++r) {
+        for (const int duty : g_pwmDuty) {
+            for (size_t pi = 0; pi < g_pwmPeriodUs.size() && !g_stop.load() && !stuck; ++pi) {
+                PwmSeg s;
+                s.duty = std::min(std::max(duty, 0), 100);
+                s.periodUs = std::max(g_pwmPeriodUs[pi], 500);
+                if ((s.duty == 0 || s.duty == 100) && pi > 0) continue;  // без переключения период ни на что не влияет
+                sleepMs(500.0);
+                wchar_t label[96];
+                if (s.duty == 0 || s.duty == 100) {
+                    swprintf(label, 96, L"ДОЛЯ %d %% - ВОДИТЕ КРУГАМИ", s.duty);
+                } else {
+                    swprintf(label, 96, L"ДОЛЯ %d %%, ПЕРИОД %.0f мс - ВОДИТЕ КРУГАМИ", s.duty, s.periodUs / 1000.0);
+                }
+                labels.emplace_back(label);
+                say(labels.back().c_str(), kPwmHint);
+                const int64_t period = Q::fromUs(static_cast<double>(s.periodUs)), pass = period * s.duty / 100;
+                s.t0 = Q::now();
+                const int64_t end = s.t0 + Q::fromUs(g_pwmSegMs * 1000.0);
+                auto at = [&](int64_t when, bool on) {
+                    spinUntil(when);
+                    const int64_t ts = mask(on);
+                    ++s.cmds;
+                    s.lateMaxUs = std::max(s.lateMaxUs, Q::toUs(ts - when));
+                };
+                if (s.duty == 0) {
+                    at(s.t0, true);
+                } else if (s.duty < 100) {
+                    // период: сначала пропуск [0, pass), потом маска [pass, period)
+                    for (int64_t tk = s.t0; tk + period <= end && !g_stop.load(); tk += period) {
+                        at(tk, false);
+                        at(tk + pass, true);
+                    }
+                }
+                spinUntil(end);
+                s.t1 = mask(false);
+                say(kPwmFree, kPwmHint);
+                const auto l = b.locks();
+                if (!(l && *l == 0) && !b.unlockAll()) {
+                    std::printf("[-] маска не снялась\n");
+                    stuck = true;
+                }
+                segs.push_back(s);
+            }
+        }
+    }
+    sleepMs(500.0);
+    const int64_t tEnd = Q::now();
+    const bool clean = b.unlockAll();
+    const auto fw = b.ask(0x04);
+    say(L"ГОТОВО");
+    std::printf("блокировки сняты: %s | плата после прогона %s\n",
+        clean ? "да (снимок 0x56 = 0000)" : "НЕТ - запустите example_line.exe --check", fw ? "отвечает" : "НЕ ОТВЕЧАЕТ");
+    if (segs.empty()) return 1;
+    Sleep(50);
+    const Track tr = buildTrack(tStart, Q::now());
+    printRawRate(tr);
+
+    // На свободе: между отрезками, с запасом 20 мс после снятия маски.
+    PwmSum base;
+    pwmAdd(base, tr, tStart, segs.front().t0);
+    for (size_t i = 0; i < segs.size(); ++i) {
+        pwmAdd(base, tr, segs[i].t1 + Q::fromUs(20000.0), i + 1 < segs.size() ? segs[i + 1].t0 : tEnd);
+    }
+    const char* what = g_pwmBoth ? "сообщений с движением / всех сообщений" : g_pwmOneWay ? "путь вправо / путь влево" : "путь X / путь Y";
+    std::printf("на свободе: %s = %.3f (%lld / %lld), интервалов ~1 мс %.1f %%\n", what, base.ratio(),
+        static_cast<long long>(base.num), static_cast<long long>(base.den), pct(base.oneMs, base.gaps));
+    if (base.den < 500 || base.num < 500) {
+        std::printf("[-] на свободе мало движения: рука не водила кругами, прогон не зачётный\n");
+        return 1;
+    }
+    std::printf("маска: %s. Фактическая доля = (%s под переключением) / (то же на свободе)\n",
+        g_pwmBoth ? "X и Y" : g_pwmOneWay ? "только +X (вправо)" : "X в обе стороны", what);
+    if (g_pwmBoth) {
+        std::printf("    под маской отчёты приходят каждую мс, но пустые; мера верна, пока рука не останавливается\n");
+    }
+    std::printf("доля %% | период мс | команд/с | опоздание команды max, мс | факт. доля %% | по отрезкам min..max | "
+                "интервалов ~1 мс %% | max пауза мс | путь под маской по 8 долям периода, %% | замечание\n");
+    for (const int dutyRaw : g_pwmDuty) {
+        const int duty = std::min(std::max(dutyRaw, 0), 100);
+        for (size_t pi = 0; pi < g_pwmPeriodUs.size(); ++pi) {
+            const int per = std::max(g_pwmPeriodUs[pi], 500);
+            if ((duty == 0 || duty == 100) && pi > 0) continue;
+            PwmSum all;
+            double lo = 1e9, hi = -1.0, late = 0.0;
+            uint64_t cmds = 0;
+            size_t n = 0;
+            int64_t phase[8] = {0};
+            for (const PwmSeg& s : segs) {
+                if (s.duty != duty || s.periodUs != per) continue;
+                ++n;
+                cmds += s.cmds;
+                late = std::max(late, s.lateMaxUs);
+                // первые 5 мс не в счёт: первая команда ещё в пути
+                const int64_t a = s.t0 + Q::fromUs(5000.0);
+                pwmAdd(all, tr, a, s.t1);
+                PwmSum one;
+                pwmAdd(one, tr, a, s.t1);
+                if (one.den >= 100) {
+                    const double f = 100.0 * one.ratio() / base.ratio();
+                    lo = std::min(lo, f);
+                    hi = std::max(hi, f);
+                }
+                const int64_t period = Q::fromUs(static_cast<double>(per));
+                for (size_t i = tr.upto(a); i < tr.upto(s.t1); ++i) {
+                    const int64_t ph = ((tr.t[i] - s.t0) % period) * 8 / period;
+                    phase[ph] += g_pwmBoth ? std::abs(tr.dx[i]) + std::abs(tr.dy[i]) :
+                        g_pwmOneWay ? std::max(tr.dx[i], 0) : std::abs(tr.dx[i]);
+                }
+            }
+            if (!n) continue;
+            char hist[96] = {0};
+            int64_t total = 0;
+            for (const int64_t v : phase) total += v;
+            for (const int64_t v : phase) {
+                char cell[12];
+                std::snprintf(cell, sizeof(cell), "%4.0f", total ? 100.0 * static_cast<double>(v) / static_cast<double>(total) : 0.0);
+                std::strncat(hist, cell, sizeof(hist) - std::strlen(hist) - 1);
+            }
+            const bool moved = g_pwmBoth || all.den >= 300;
+            char spread[32] = "-";
+            if (hi >= 0.0) std::snprintf(spread, sizeof(spread), "%.0f..%.0f", lo, hi);
+            std::printf("%6d | %9.1f | %8.0f | %25.2f | %12.1f | %20s | %19.1f | %12.1f | %s | %s\n", duty, per / 1000.0,
+                static_cast<double>(cmds) / (static_cast<double>(n) * g_pwmSegMs / 1000.0), late / 1000.0,
+                moved ? 100.0 * all.ratio() / base.ratio() : 0.0, spread, pct(all.oneMs, all.gaps), all.maxGapMs,
+                (duty == 0 || duty == 100) ? "                               -" : hist,
+                moved ? "" : "рука не шла - не проверено");
+        }
+    }
+    // Паузы в потоке отчётов под переключением: остановка руки или дыра? Мышь без движения отчётов
+    // не шлёт, поэтому смотрим путь за 30 мс до и после: быстрая рука за 100+ мс не встаёт и не разгоняется.
+    for (const PwmSeg& s : segs) {
+        const size_t i0 = tr.upto(s.t0 + Q::fromUs(5000.0)), i1 = tr.upto(s.t1);
+        for (size_t i = i0 + 1; i < i1; ++i) {
+            const double gapMs = Q::toUs(tr.t[i] - tr.t[i - 1]) / 1000.0;
+            if (gapMs < 20.0) continue;
+            int64_t before = 0, after = 0;
+            for (size_t k = tr.upto(tr.t[i - 1] - Q::fromUs(30000.0)); k < i; ++k) before += std::abs(tr.dx[k]) + std::abs(tr.dy[k]);
+            for (size_t k = i; k < tr.upto(tr.t[i] + Q::fromUs(30000.0)); ++k) after += std::abs(tr.dx[k]) + std::abs(tr.dy[k]);
+            std::printf("пауза %.1f мс: доля %d %%, период %.1f мс, на %.0f-й мс отрезка | путь за 30 мс до паузы %lld, после %lld отсчётов "
+                        "(под маской проходит только доля)\n", gapMs, s.duty, s.periodUs / 1000.0, Q::toUs(tr.t[i - 1] - s.t0) / 1000.0,
+                static_cast<long long>(before), static_cast<long long>(after));
+        }
+    }
+    return 0;
+}
+
+// ---- --assist: инжект тянет к точке, рука доводит под частичной блокировкой ----------------
+// Сценарий владельца: в окне красный круг. Инжект через эталон (замкнутый контур по GetCursorPos,
+// 1 кГц) тянет курсор к точке в 30-45 пикс. от центра круга, то есть мимо. Рука доводит курсор в
+// круг и держит 0.25 с. Варианты по очереди: без маски (рука 100 %) и с переключением маски X+Y
+// через tx.setLocks() (доля --duty, периоды --pwmperiod). Переключение начинается вместе с
+// инжектом и идёт до конца попытки. Что считается: сколько команд маски эталон успел отправить
+// рядом с инжектом, фактическая доля руки после конца инжекта (сообщения Raw Input с движением /
+// все), время доведения, счётчики эталона.
+struct AssistTrial {
+    int variant = 0;  // 0 - без маски, k - период g_pwmPeriodUs[k-1]
+    double dist0 = 0.0, pullMs = 0.0, handMs = 0.0, totalMs = 0.0, pullMissPx = 0.0;
+    bool timeout = false;
+    int64_t tPullEnd = 0, tEnd = 0;
+    uint64_t toggles = 0, lockCmds = 0, records = 0, merged = 0, repairs = 0;
+};
+
+inline POINT cursorClient() {
+    POINT p{};
+    GetCursorPos(&p);
+    ScreenToClient(g_ui.hwnd, &p);
+    return p;
+}
+
+inline void showTarget(int x, int y) {
+    g_ui.tgtX = x;
+    g_ui.tgtY = y;
+    if (g_ui.hwnd) InvalidateRect(g_ui.hwnd, nullptr, FALSE);
+}
+
+template <class T>
+int runAssist(int trials) {
+    typename T::Tx tx;
+    std::string err;
+    if (!T::open(tx, err)) {
+        std::printf("[-] %s\n", err.c_str());
+        return 1;
+    }
+    if (g_pwmDuty.empty()) g_pwmDuty.push_back(50);
+    if (g_pwmPeriodUs.empty()) g_pwmPeriodUs.push_back(16000);
+    const int duty = std::min(std::max(g_pwmDuty[0], 0), 100);
+    std::printf("[+] эталон: %s | доля руки %d %%, maxLag %u\n", tx.info().c_str(), duty, static_cast<unsigned>(tx.maxLag()));
+    using makcu::LockTarget;
+    static const wchar_t* const kHint = L"курсор сам едет к красному кругу, но мимо центра: доведите рукой в круг и подержите";
+    say(L"ДОВОДИТЕ КУРСОР В КРАСНЫЙ КРУГ", kHint);
+    sleepMs(2500.0);
+
+    // Поле целей: область ClipCursor в координатах клиента, с отступом.
+    POINT org{0, 0};
+    ClientToScreen(g_ui.hwnd, &org);
+    const int x0 = g_ui.clip.left - org.x + 50, x1 = g_ui.clip.right - org.x - 50;
+    const int y0 = g_ui.clip.top - org.y + 50, y1 = g_ui.clip.bottom - org.y - 50;
+    uint32_t rng = static_cast<uint32_t>(Q::now()) | 1u;
+    auto rnd = [&rng](int lo, int hi) {  // xorshift: [lo, hi]
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        return lo + static_cast<int>(rng % static_cast<uint32_t>(hi - lo + 1));
+    };
+    const size_t variants = 1 + (duty < 100 ? g_pwmPeriodUs.size() : 0);
+    static std::vector<std::wstring> labels;
+    labels.clear();
+    labels.push_back(L"ДОВЕДИТЕ В КРУГ   |   рука 100 % (маски нет)");
+    for (size_t i = 1; i < variants; ++i) {
+        wchar_t l[96];
+        swprintf(l, 96, L"ДОВЕДИТЕ В КРУГ   |   рука %d %%, период %.0f мс", duty, std::max(g_pwmPeriodUs[i - 1], 500) / 1000.0);
+        labels.emplace_back(l);
+    }
+    std::vector<AssistTrial> rs;
+    const int64_t tStart = Q::now();
+    for (int n = 0; n < trials && !g_stop.load(); ++n) {
+        AssistTrial r;
+        r.variant = static_cast<int>(static_cast<size_t>(n) % variants);
+        const POINT c0 = cursorClient();
+        int gx = 0, gy = 0;
+        for (int tries = 0; tries < 200; ++tries) {
+            gx = rnd(x0, x1);
+            gy = rnd(y0, y1);
+            if (std::hypot(gx - c0.x, gy - c0.y) >= 250.0) break;
+        }
+        // Точка, к которой тянет инжект: в 30-45 пикс. от центра круга.
+        const double ang = rnd(0, 6283) / 1000.0, off = rnd(30, 45);
+        const double sx = gx + off * std::cos(ang), sy = gy + off * std::sin(ang);
+        r.dist0 = std::hypot(gx - c0.x, gy - c0.y);
+        say(L"", labels[static_cast<size_t>(r.variant)].c_str());
+        showTarget(gx, gy);
+        const auto st0 = tx.stats();
+        const uint64_t merged0 = T::merged(st0), rec0 = T::records(st0);
+        const int64_t period = Q::fromUs(static_cast<double>(std::max(r.variant ? g_pwmPeriodUs[static_cast<size_t>(r.variant) - 1] : 16000, 500)));
+        const int64_t pass = period * duty / 100;
+        const int64_t t0 = Q::now();
+        int64_t due = t0, inSince = 0, tEnter = 0;
+        bool maskOn = false, pulling = true;
+        double fx = 0.0, fy = 0.0;
+        int64_t pendX = 0, pendY = 0;
+        for (;;) {
+            spinUntil(due);
+            due += Q::fromUs(1000.0);
+            const int64_t now = Q::now();
+            if (g_stop.load()) break;
+            if (now - t0 > Q::fromUs(6e6)) {
+                r.timeout = true;
+                break;
+            }
+            if (r.variant) {
+                const bool want = (now - t0) % period >= pass;
+                if (want != maskOn) {
+                    tx.setLocks({LockTarget::X, LockTarget::Y}, want);
+                    maskOn = want;
+                    ++r.toggles;
+                }
+            }
+            const POINT p = cursorClient();
+            if (pulling) {
+                const double ex = sx - p.x, ey = sy - p.y, d = std::hypot(ex, ey);
+                if (d <= 4.0 || now - t0 > Q::fromUs(2.5e6)) {
+                    pulling = false;
+                    r.tPullEnd = now;
+                    r.pullMs = Q::toUs(now - t0) / 1000.0;
+                    r.pullMissPx = d;
+                } else {
+                    // скорость: 5 1/с от расстояния, 120...1200 пикс/с; шаг за тик не длиннее остатка
+                    const double v = std::min(std::max(5.0 * d, 120.0), 1200.0), step = std::min(v * 0.001, d);
+                    fx += ex / d * step;
+                    fy += ey / d * step;
+                    const int64_t ix = std::llround(fx), iy = std::llround(fy);
+                    fx -= static_cast<double>(ix);
+                    fy -= static_cast<double>(iy);
+                    pendX += ix;
+                    pendY += iy;
+                    if ((pendX || pendY) && tx.move(static_cast<int16_t>(pendX), static_cast<int16_t>(pendY))) pendX = pendY = 0;
+                }
+            }
+            if (std::hypot(gx - p.x, gy - p.y) <= kTgtR) {
+                if (!inSince) inSince = now;
+                if (now - inSince >= Q::fromUs(250000.0)) {
+                    tEnter = inSince;
+                    break;
+                }
+            } else {
+                inSince = 0;
+            }
+        }
+        r.tEnd = Q::now();
+        if (pulling) {  // рука довела раньше, чем инжект доехал
+            r.tPullEnd = r.tEnd;
+            r.pullMs = Q::toUs(r.tEnd - t0) / 1000.0;
+        }
+        tx.unlockAll();
+        showTarget(-1, -1);
+        const int64_t uEnd = Q::now() + Q::fromUs(300000.0);
+        while (tx.locksOnBoard() != 0 && Q::now() < uEnd && !g_stop.load()) Sleep(1);
+        const auto st1 = tx.stats();
+        r.lockCmds = st1.lockCommands - st0.lockCommands;
+        r.repairs = st1.repairs - st0.repairs;
+        r.records = T::records(st1) - rec0;
+        r.merged = T::merged(st1) - merged0;
+        r.totalMs = tEnter ? Q::toUs(tEnter - t0) / 1000.0 : Q::toUs(r.tEnd - t0) / 1000.0;
+        r.handMs = tEnter > r.tPullEnd ? Q::toUs(tEnter - r.tPullEnd) / 1000.0 : 0.0;
+        rs.push_back(r);
+        sleepMs(500.0);
+    }
+    showTarget(-1, -1);
+    tx.unlockAll();
+    sleepMs(300.0);
+    std::printf("%s\n", tx.statsLine().c_str());
+    const uint16_t left = tx.locksOnBoard();
+    tx.close();
+    say(L"ГОТОВО");
+    std::printf("блокировки на плате после прогона: %04X%s\n", left, left ? "  <-- НЕ СНЯТЫ: запустите example_line.exe --check" : " (сняты)");
+    if (rs.empty()) return 1;
+    Sleep(50);
+    const Track tr = buildTrack(tStart, Q::now());
+    printRawRate(tr);
+    auto varName = [&](int v) {
+        char b[48];
+        if (v == 0) std::snprintf(b, sizeof(b), "рука 100 %%      ");
+        else std::snprintf(b, sizeof(b), "рука %2d %%, %2.0f мс", duty, std::max(g_pwmPeriodUs[static_cast<size_t>(v) - 1], 500) / 1000.0);
+        return std::string(b);
+    };
+    // Доля руки после конца инжекта: сообщения с движением / все (под маской отчёты пустые).
+    auto handShare = [&](const AssistTrial& r, size_t& all) {
+        size_t nz = 0;
+        all = 0;
+        for (size_t i = tr.upto(r.tPullEnd + Q::fromUs(15000.0)); i < tr.upto(r.tEnd); ++i) {
+            ++all;
+            if (tr.dx[i] || tr.dy[i]) ++nz;
+        }
+        return pct(nz, all);
+    };
+    std::printf("\n №  | вариант           | до круга, пикс | инжект тянул, мс (мимо точки, пикс) | доведение рукой, мс | всего, мс | "
+                "переключений задано / команд маски ушло | доля руки после инжекта, %% (сообщений) | записей | склеено | повторов\n");
+    for (size_t i = 0; i < rs.size(); ++i) {
+        const AssistTrial& r = rs[i];
+        size_t all = 0;
+        const double sh = handShare(r, all);
+        std::printf("%3zu | %s | %14.0f | %16.0f (%4.1f) | %19.0f | %9.0f | %10llu / %-10llu | %14.1f (%zu) | %7llu | %7llu | %llu%s\n", i,
+            varName(r.variant).c_str(), r.dist0, r.pullMs, r.pullMissPx, r.handMs, r.totalMs,
+            static_cast<unsigned long long>(r.toggles), static_cast<unsigned long long>(r.lockCmds), sh, all,
+            static_cast<unsigned long long>(r.records), static_cast<unsigned long long>(r.merged),
+            static_cast<unsigned long long>(r.repairs),
+            r.timeout ? "  <-- не доведено за 6 с" : r.handMs == 0.0 ? "  <-- рука довела раньше, чем инжект доехал" : "");
+    }
+    auto med = [](std::vector<double> v) {
+        if (v.empty()) return -1.0;
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    std::printf("\nитог по вариантам (медианы; доля руки и команды - суммой)\n");
+    for (size_t v = 0; v < variants; ++v) {
+        std::vector<double> pull, hand, total;
+        uint64_t tog = 0, cmds = 0, recs = 0, mrg = 0, rep = 0;
+        size_t nz = 0, all = 0, n = 0, to = 0;
+        double secs = 0.0;
+        for (const AssistTrial& r : rs) {
+            if (r.variant != static_cast<int>(v)) continue;
+            ++n;
+            to += r.timeout ? 1 : 0;
+            pull.push_back(r.pullMs);
+            hand.push_back(r.handMs);
+            total.push_back(r.totalMs);
+            tog += r.toggles;
+            cmds += r.lockCmds;
+            recs += r.records;
+            mrg += r.merged;
+            rep += r.repairs;
+            secs += Q::toUs(r.tEnd - r.tPullEnd + Q::fromUs(r.pullMs * 1000.0)) / 1e6;
+            for (size_t i = tr.upto(r.tPullEnd + Q::fromUs(15000.0)); i < tr.upto(r.tEnd); ++i) {
+                ++all;
+                if (tr.dx[i] || tr.dy[i]) ++nz;
+            }
+        }
+        if (!n) continue;
+        std::printf("  %s: попыток %zu, не доведено %zu | инжект тянул %.0f мс | доведение рукой %.0f мс | всего %.0f мс | "
+                    "переключений задано %llu, команд маски ушло %llu (%.0f /с) | доля руки после инжекта %.1f %% | "
+                    "записей %llu, склеено %llu (%.1f %%), повторов %llu\n",
+            varName(static_cast<int>(v)).c_str(), n, to, med(pull), med(hand), med(total), static_cast<unsigned long long>(tog),
+            static_cast<unsigned long long>(cmds), secs > 0.0 ? static_cast<double>(cmds) / secs : 0.0, pct(nz, all),
+            static_cast<unsigned long long>(recs), static_cast<unsigned long long>(mrg), pct(mrg, recs + mrg),
+            static_cast<unsigned long long>(rep));
+    }
+    return 0;
+}
+
+// ---- --sens: чувствительность физической мыши через эталон (tx.setSensitivity) -------------
+// Рука водит кругами. Отрезок --seg мс с заданной чувствительностью, между отрезками 0.5 с при
+// 100 %. Фактическая доля = сообщения Raw Input с движением / все сообщения (под маской отчёты
+// идут каждую мс, но пустые), делённая на то же на свободе.
+template <class T>
+int runSens(int rounds) {
+    if constexpr (!HasSens<typename T::Tx>::value) {
+        (void)rounds;
+        std::printf("[-] в эталоне этого канала setSensitivity() пока нет\n");
+        return 1;
+    } else {
+        typename T::Tx tx;
+        std::string err;
+        if (!T::open(tx, err)) {
+            std::printf("[-] %s\n", err.c_str());
+            return 1;
+        }
+        if (g_pwmDuty.empty()) g_pwmDuty = {100, 75, 50, 33, 25, 10};
+        std::printf("[+] эталон: %s\n", tx.info().c_str());
+        static const wchar_t* const kHint =
+            L"водите кругами, не останавливаясь: курсор будет идти медленнее, это замер чувствительности";
+        static const wchar_t* const kFree = L"100 % - ВОДИТЕ КРУГАМИ";
+        say(kFree, kHint);
+        sleepMs(1500.0);
+        static std::vector<std::wstring> labels;
+        labels.clear();
+        labels.reserve(static_cast<size_t>(rounds) * g_pwmDuty.size() + 1);
+        struct Seg {
+            int pct = 0;
+            int64_t t0 = 0, t1 = 0;
+            uint64_t toggles = 0;
+        };
+        std::vector<Seg> segs;
+        const int64_t tStart = Q::now();
+        for (int r = 0; r < rounds && !g_stop.load(); ++r) {
+            for (const int d : g_pwmDuty) {
+                if (g_stop.load()) break;
+                sleepMs(500.0);
+                Seg s;
+                s.pct = std::min(std::max(d, 0), 100);
+                wchar_t label[96];
+                swprintf(label, 96, L"ЧУВСТВИТЕЛЬНОСТЬ %d %% - ВОДИТЕ КРУГАМИ", s.pct);
+                labels.emplace_back(label);
+                say(labels.back().c_str(), kHint);
+                const uint64_t tog0 = tx.stats().sensToggles;
+                tx.setSensitivity(s.pct);
+                s.t0 = Q::now();
+                sleepMs(g_pwmSegMs);
+                s.t1 = Q::now();
+                tx.setSensitivity(100);
+                s.toggles = tx.stats().sensToggles - tog0;
+                say(kFree, kHint);
+                segs.push_back(s);
+            }
+        }
+        sleepMs(500.0);
+        const int64_t tEnd = Q::now();
+        tx.setSensitivity(100);
+        sleepMs(100.0);
+        std::printf("%s\n", tx.statsLine().c_str());
+        const uint16_t left = tx.locksOnBoard();
+        tx.close();
+        say(L"ГОТОВО");
+        std::printf("блокировки на плате перед close(): %04X%s\n", left, left ? "  <-- маска осталась" : " (сняты)");
+        if (segs.empty()) return 1;
+        Sleep(50);
+        const Track tr = buildTrack(tStart, Q::now());
+        printRawRate(tr);
+        struct Sum {
+            size_t nz = 0, all = 0, gaps = 0, oneMs = 0;
+            double maxGapMs = 0.0;
+        };
+        auto add = [&](Sum& s, int64_t a, int64_t z) {
+            const size_t i0 = tr.upto(a), i1 = tr.upto(z);
+            for (size_t i = i0; i < i1; ++i) {
+                ++s.all;
+                if (tr.dx[i] || tr.dy[i]) ++s.nz;
+                if (i > i0) {
+                    const double us = Q::toUs(tr.t[i] - tr.t[i - 1]);
+                    if (us < 20000.0) {
+                        ++s.gaps;
+                        if (us >= 500.0 && us < 1500.0) ++s.oneMs;
+                    }
+                    s.maxGapMs = std::max(s.maxGapMs, us / 1000.0);
+                }
+            }
+        };
+        Sum base;
+        add(base, tStart, segs.front().t0);
+        for (size_t i = 0; i < segs.size(); ++i) {
+            add(base, segs[i].t1 + Q::fromUs(20000.0), i + 1 < segs.size() ? segs[i + 1].t0 : tEnd);
+        }
+        const double baseShare = base.all ? static_cast<double>(base.nz) / static_cast<double>(base.all) : 0.0;
+        std::printf("на 100 %%: сообщений с движением %zu из %zu (%.1f %%), интервалов ~1 мс %.1f %%\n", base.nz, base.all,
+            100.0 * baseShare, pct(base.oneMs, base.gaps));
+        if (base.nz < 500) {
+            std::printf("[-] на свободе мало движения: рука не водила кругами, прогон не зачётный\n");
+            return 1;
+        }
+        std::printf("задано %% | факт. доля %% | по отрезкам min..max | переключений маски в с | интервалов ~1 мс %% | max пауза мс | сообщений\n");
+        for (const int dRaw : g_pwmDuty) {
+            const int d = std::min(std::max(dRaw, 0), 100);
+            Sum all;
+            double lo = 1e9, hi = -1.0, secs = 0.0;
+            uint64_t tog = 0;
+            for (const Seg& s : segs) {
+                if (s.pct != d) continue;
+                const int64_t a = s.t0 + Q::fromUs(10000.0);  // первые 10 мс: значение ещё применяется
+                add(all, a, s.t1);
+                Sum one;
+                add(one, a, s.t1);
+                if (one.all >= 200) {
+                    const double f = pct(one.nz, one.all) / baseShare;
+                    lo = std::min(lo, f);
+                    hi = std::max(hi, f);
+                }
+                tog += s.toggles;
+                secs += Q::toUs(s.t1 - s.t0) / 1e6;
+            }
+            if (!all.all) continue;
+            char spread[32] = "-";
+            if (hi >= 0.0) std::snprintf(spread, sizeof(spread), "%.1f..%.1f", lo, hi);
+            std::printf("%8d | %12.1f | %20s | %22.0f | %19.1f | %12.1f | %zu\n", d, pct(all.nz, all.all) / baseShare, spread,
+                secs > 0.0 ? static_cast<double>(tog) / secs : 0.0, pct(all.oneMs, all.gaps), all.maxGapMs, all.all);
+        }
+        return 0;
+    }
+}
+
 // ---- разбор ключей и запуск: общее для UDP- и COM-стенда ---------------------------------
 struct Args {
     double accuracyS = 0.0, trackS = 0.0, lossS = 0.0;
-    int lockN = 0, injectN = 0, refLockN = 0, trackInjectN = 0;
+    int lockN = 0, injectN = 0, refLockN = 0, trackInjectN = 0, pwmN = 0, assistN = 0, sensN = 0;
     bool any() const {
-        return accuracyS > 0.0 || lockN > 0 || injectN > 0 || lossS > 0.0 || refLockN > 0 || trackS > 0.0 || trackInjectN > 0;
+        return accuracyS > 0.0 || lockN > 0 || injectN > 0 || lossS > 0.0 || refLockN > 0 || trackS > 0.0 ||
+            trackInjectN > 0 || pwmN > 0 || assistN > 0 || sensN > 0;
     }
 };
 
@@ -1246,6 +1899,15 @@ inline bool parseArg(Args& a, int& i, int argc, char** argv) {
     else if (std::strcmp(k, "--busy") == 0) g_busy = true;
     else if (std::strcmp(k, "--track") == 0 && more) a.trackS = std::atof(argv[++i]);
     else if (std::strcmp(k, "--trackinject") == 0 && more) a.trackInjectN = std::atoi(argv[++i]);
+    else if (std::strcmp(k, "--pwm") == 0 && more) a.pwmN = std::atoi(argv[++i]);
+    else if (std::strcmp(k, "--assist") == 0 && more) a.assistN = std::atoi(argv[++i]);
+    else if (std::strcmp(k, "--sens") == 0 && more) a.sensN = std::atoi(argv[++i]);
+    else if (std::strcmp(k, "--withsens") == 0 && more) g_withSens = std::atoi(argv[++i]);
+    else if (std::strcmp(k, "--duty") == 0 && more) parseList(argv[++i], g_pwmDuty);
+    else if (std::strcmp(k, "--pwmperiod") == 0 && more) parseList(argv[++i], g_pwmPeriodUs);
+    else if (std::strcmp(k, "--oneway") == 0) g_pwmOneWay = true;
+    else if (std::strcmp(k, "--both") == 0) g_pwmBoth = true;
+    else if (std::strcmp(k, "--seg") == 0 && more) g_pwmSegMs = std::max(std::atof(argv[++i]), 100.0);
     else if (std::strcmp(k, "--dur") == 0 && more) {
         g_injectDurMs.clear();
         parseList(argv[++i], g_injectDurMs);
@@ -1283,6 +1945,10 @@ int benchMain(const Args& a) {
         rc = runTrack<T>(a.trackS);
     } else if (a.trackInjectN > 0) {
         rc = runTrackInject<T>(a.trackInjectN);
+    } else if (a.assistN > 0) {
+        rc = runAssist<T>(a.assistN);
+    } else if (a.sensN > 0) {
+        rc = runSens<T>(a.sensN);
     } else {
         typename T::Board b;
         std::string err;
@@ -1294,7 +1960,8 @@ int benchMain(const Args& a) {
             rc = 1;
         } else {
             std::printf("[+] прошивка %u\n", static_cast<unsigned>((*fw)[0] | (*fw)[1] << 8 | (*fw)[2] << 16 | (*fw)[3] << 24));
-            rc = a.accuracyS > 0.0 ? runAccuracy(b, a.accuracyS) : a.lossS > 0.0 ? runLockLoss(b, a.lossS) : runLock(b, a.lockN);
+            rc = a.pwmN > 0 ? runPwm(b, a.pwmN) : a.accuracyS > 0.0 ? runAccuracy(b, a.accuracyS) :
+                a.lossS > 0.0 ? runLockLoss(b, a.lossS) : runLock(b, a.lockN);
         }
     }
     g_cleanDone = true;

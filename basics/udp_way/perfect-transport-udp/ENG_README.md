@@ -9,22 +9,23 @@
 > **silently drops** these packets for any program that has no allow rule. Movement still works, but
 > buttons fall back to the 5 ms backup poll (`statsLine()` prints "СОБЫТИЯ НЕ ДОХОДЯТ", i.e. "EVENTS ARE NOT ARRIVING").
 >
-> **Once, in PowerShell as administrator**, pick one:
+> **Once: run `setup_firewall.bat`** from this folder (double click, UAC asks for rights). It creates or
+> replaces the rule "MAKCU UDP events": inbound UDP from the local subnet for any program. You do not need
+> the board's IP, and a new address does not break the rule. The price: any device on this subnet, not only
+> the board, may send UDP to programs on the PC. Parameters narrow it:
 >
 > ```powershell
-> # allow inbound UDP only from the board, for any program (recommended; done on our machine 2026-10-12)
-> New-NetFirewallRule -DisplayName "MAKCU UDP events" -Direction Inbound -Protocol UDP -RemoteAddress 192.168.50.175 -Action Allow
+> .\setup_firewall.bat -Check                         # show the state, change nothing, no rights needed
+> .\setup_firewall.bat -InterfaceAlias Ethernet       # the rule for this adapter only
+> .\setup_firewall.bat -RemoteAddress 192.168.50.175  # this address only, rerun when the IP changes
+> .\setup_firewall.bat -Remove                        # delete the rule
 > ```
 >
-> or mark the network as private (on our machine the Private firewall is off):
+> Instead of the rule you can mark the network as private (on our machine the Private firewall is off):
+> `Set-NetConnectionProfile -InterfaceAlias "Ethernet" -NetworkCategory Private`.
 >
-> ```powershell
-> Set-NetConnectionProfile -InterfaceAlias "Ethernet" -NetworkCategory Private
-> ```
->
-> **If the board's IP changes** (DHCP), the rule with `-RemoteAddress` has to be updated:
-> `Set-NetFirewallRule -DisplayName "MAKCU UDP events" -RemoteAddress <new IP>`.
-> To check the rule exists: `Get-NetFirewallRule -DisplayName "MAKCU UDP events"`.
+> **On this PC** the rule from 2026-10-12 for `192.168.50.175` only is still in force. The script has not
+> been run with administrator rights yet: `-Check`, `-WhatIf` and the refusal of a bad address were checked.
 
 The reference working transport for the network, split out into one folder, modelled on
 [`../../comport_way/perfect-transport-comport`](../../comport_way/perfect-transport-comport/ENG_README.md). It **only
@@ -81,18 +82,52 @@ this limit does not trigger in practice.
 | `makcu_udp_batch_transport.h` | **the whole transport**: one header, WinAPI only (Winsock 2) |
 | `example_line.cpp` | an embedding example and a self-check on hardware (a model of the 1 ms loop + a HID counter) |
 | `controls_test.cpp` | a check of buttons, button and axis locks, reconnect and a long run (a test window, the cursor is confined to it) |
-| `build_example.bat` | build of both: MinGW-w64 g++, C++17+ |
+| `makcu_udp_discover.h` | finds the board on the network, separate from the transport (optional) |
+| `find_makcu.cpp` | lists the boards on the network: `find_makcu.exe [--port 8080]` |
+| `setup_firewall.bat`, `setup_firewall.ps1` | the firewall rule for button events |
+| `build_example.bat` | builds all three programs: MinGW-w64 g++, C++17+ |
 
-To use it: copy `makcu_udp_batch_transport.h`, link `-lws2_32` (in MSVC that is `ws2_32.lib`).
+To use it: copy `makcu_udp_batch_transport.h` (and `makcu_udp_discover.h` if you want the search), link
+`-lws2_32` (in MSVC that is `ws2_32.lib`).
+
+## The board's address and auto search
+
+Every user has a different address: in Device mode the router's DHCP assigns it, and `192.168.50.175` exists
+only on our network. Port 8080 is the default, but it is a board setting. Network discovery exists neither in
+`MAK_API.md`, nor in the Raw contract, nor in the mak-suite SDK (`host` is mandatory for UDP there), so
+`makcu_udp_discover.h` finds the board by a sweep. The transport did not change: the header only returns an
+address for `open()`. `example_line`, `controls_test` and `track_test` use it themselves, their `--host`
+defaults to `auto`.
+
+- `host = "auto"`: the remembered address (`%LOCALAPPDATA%\MAKCU\udp_board.txt`, a line `IP MAC`), otherwise
+  a sweep. With several boards the remembered MAC wins, otherwise an error lists them.
+- `host` = a MAC (`6c-1f-f7-c5-c6-68`, `:` also works): that exact board, since a MAC does not change.
+- Anything else (IP, name) is returned as is, the network is not touched.
+
+The sweep sends `GET DEVICE 0x02` to every address of the PC's subnets, 3 passes of 200 ms. Only a RAW wrapper
+frame with our nonce and opcode `0x02` counts as a board, then `FIRMWARE 0x04` and the MAC from status `0x3D`
+are read one at a time. It only reads. Check with `find_makcu.exe` (no hand needed, the cursor does not move).
+
+Measured 2026-10-31 on this PC (3 /24 subnets): full sweep 609–610 ms; remembered address 0–15 ms with no
+sweep; stale address 1063–1110 ms, same board picked by MAC; `example_line.exe --check` as a whole 802 ms, 54 ms
+with the remembered address. Two boards without a remembered one, an unknown MAC and a port with no boards give
+an error; wrong nonce, garbage and silence on port 8080 are rejected. The second board and the strangers were
+Python fakes on this PC's virtual adapters, which is why the sweep does not skip the PC's own address.
+
+Limits: only one /24 around the PC's address is swept even in a wider subnet; 169.254.x.x is skipped; another
+command port must be passed explicitly; `open()` keeps the IP, so if DHCP changes it mid-session close the
+transport and go through `resolveUdpHost` + `open()` again. Not verified: a real second board, Host mode,
+whether the board answers a broadcast, another PC, and searching while another program is commanding the board.
 
 ## Usage
 
 ```cpp
 #include "makcu_udp_batch_transport.h"
+#include "makcu_udp_discover.h"            // board search, optional
 
 makcu::UdpBatchTransport tx;
-std::string err;
-if (!tx.open("192.168.50.175", 8080, err)) { /* err - the reason */ }
+std::string host = "auto", err;            // or a known IP: then there is no search
+if (!makcu::resolveUdpHost(host, 8080, err) || !tx.open(host, 8080, err)) { /* err - the reason */ }
 
 // timing thread, every tick (usually 1 ms):
 pendX += dx; pendY += dy;                      // your whole report for the tick
@@ -141,6 +176,7 @@ if (!tx.connected()) { /* the link is lost, the transport reconnects by itself *
 | `setMaxLag(n)` / `maxLag()` | movement queue depth in records; default 5, `0` = no limit (as before revision 5). The cursor lag behind `move()` and the tail after stopping are ≈ `n` ms. Measured: with no limit the tail grows to 8 ms over 10 s, with 5 it is 3.6 ms, ~3 % merged |
 | `stopMovement(&dx, &dy)` | "freeze": records not yet sent to the board are dropped (their sum goes to `dx`/`dy`); the packet in flight and the board queue play out (cannot be recalled). The cursor stops after 2.7–3.6 ms |
 | `setTracking(on)` / `tracking()` / `physical()` | live-mouse counts from the board position `GET 0x63`. Polled in free loop slots **only while there is no movement injection**; under a full axis lock it stops 5 ms after confirmation (the position does not change there). `physical()`: `x`, `y` accumulated since `setTracking(true)`, `samples`, `sampleQpc`, `live`. The first `move()` closes the segment, the next starts ~8 ms after the last `move()` (the board drains its queue). Polling takes the single slot: `move()`/`press()`/`setLocks()` wait for its reply (up to ~2 ms). While tracking, `km.screen` = 32767×32767 (±16k counts, re-centred when the mouse is still), restored afterwards. `setTracking(true)` blocks up to ~0.3 s |
+| `setSensitivity(pct)` / `sensitivity()` | (2026-11-12, board on V4.122) share of **physical** mouse movement that reaches the PC, 0…100 %; 100 is off (default), 50 is like halving the DPI. Same call as in the COM reference: any thread, non-blocking, changeable on the fly, `close()` restores 100, injection is not scaled. The loop toggles the `SET 0x16` direction mask in whole-millisecond windows of at least 6 ms (a no-reply command holds the channel for 3 ms and movement packets need room too), so it is coarser than COM: 83 bursts per second at 50 %, 6 ms moving and 54 ms still at 10 %. Measured: 75 / 50 / 33 / 25 / 10 % requested gave 75.6 / 49.8 / 33.6 / 24.4 / 10.0 %. Injection under 50 % keeps the exact path but gets coarser: 25 % of `move()` calls merged against 6–7 %, 1 ms intervals 83–85 % against 94–95 %, tail 3.3–8.3 ms against 3.5–6.6. Both injection runs were cut short by a board hang (once without the mask, once with it): `HANDOFF_UDP_TRACKING_HANG.md`. If the board hangs inside a mask window the hand stays locked until the board restarts. Full tables: `README.md`, "Чувствительность физической мыши" |
 | `setLock(t, on)` / `setLocks({t…}, on)` / `unlockAll()` / `locked(t)` / `locks()` / `locksOnBoard()` | physical input lock: 5 buttons, the X/Y axes and the wheel as a whole or per direction. Movement directions go as one `SET 0x16`, the wheel as one `0x17`, buttons as `SET 0x60`. What is locked does not reach the PC from the physical mouse; injection passes; `buttons()` sees the physical state even for a locked button. **Lock both axes with `setLocks({X, Y}, on)`**: one command, physical movement stops after ~1.3 ms (max 2.3). Two `setLock` calls in a row are two commands 3 ms apart (4.3 ms, max 5) |
 | `connected()` | there is a link to the board. `false` — a reconnect is in progress, `move()` returns `false` |
 | `open()` | additionally: enables the event stream, brings the board to a clean state — clears injected buttons and locks left over from a crashed program |
@@ -190,11 +226,14 @@ movement and polling work, but events do not. Then the 5 ms safety poll works (d
 shorter than 5 ms can be missed). For events to arrive, one of two things is needed (administrator rights):
 
 ```powershell
-# a rule only for packets from the board, for any program
-New-NetFirewallRule -DisplayName "MAKCU UDP events" -Direction Inbound -Protocol UDP -RemoteAddress 192.168.50.175 -Action Allow
+# a rule for packets from the local subnet, for any program (parameters are at the top of this file)
+.\setup_firewall.bat
 # or mark the network with the board as private (if the Private firewall is off or has a rule)
 Set-NetConnectionProfile -InterfaceAlias "Ethernet" -NetworkCategory Private
 ```
+
+The program's port is random, so the rule cannot be narrowed by port. Python proves nothing here:
+`anaconda python.exe` has its own allow rule and sees events without ours.
 
 The price for movement: a poll is the same kind of command in flight as a `0x6C` packet, only the reply is faster (RTT ~1 ms).
 With a 5 ms poll the packets get denser (~3 records instead of ~1.9), and 1000 Hz is kept: 2000 of 2000,

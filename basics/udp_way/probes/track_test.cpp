@@ -1,12 +1,13 @@
 // Отслеживание физической мыши через MAKCU по UDP: замеры (стенд, не эталон).
 //
-//   track_test.exe [--host 192.168.50.175] [--screen W H] MODE
+//   track_test.exe [--host auto|IP|MAC] [--screen W H] MODE
 //
 // Режимы и окно - basics/track_bench.h (общие с COM-стендом comport_way/track_test_com.cpp).
 //
 // Сборка: g++ -std=c++17 -O2 -Wall -Wextra -I ..\perfect-transport-udp track_test.cpp
 //         -lws2_32 -lwinmm -lgdi32 -static -o track_test.exe
 #include "makcu_udp_batch_transport.h"
+#include "makcu_udp_discover.h"
 
 #include "../../track_bench.h"
 
@@ -167,7 +168,7 @@ private:
     uint64_t lost_ = 0;
 };
 
-std::string g_host = "192.168.50.175";
+std::string g_host = "auto";
 uint16_t g_port = 8080;
 
 struct Udp {
@@ -187,7 +188,7 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     Args a;
     auto usage = [] {
-        std::printf("track_test.exe [--host IP] --accuracy S | --lock N | --lockloss S | --inject N | --reflock N | --track S | --trackinject N\n");
+        std::printf("track_test.exe [--host auto|IP|MAC] --accuracy S | --lock N | --lockloss S | --inject N | --reflock N | --track S | --trackinject N | --pwm N [--duty %%,..] [--pwmperiod US,..] [--oneway | --both] [--seg MS] | --assist N [--duty %%] [--pwmperiod US,..] | --sens N [--duty %%,..] [--seg MS]\n");
         return 2;
     };
     for (int i = 1; i < argc; ++i) {
@@ -195,5 +196,10 @@ int main(int argc, char** argv) {
         else if (!parseArg(a, i, argc, argv)) return usage();
     }
     if (!a.any()) return usage();
+    std::string err;
+    if (!makcu::resolveUdpHost(g_host, g_port, err)) {
+        std::printf("[-] %s\n", err.c_str());
+        return 1;
+    }
     return benchMain<Udp>(a);
 }

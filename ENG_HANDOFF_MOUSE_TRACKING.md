@@ -164,6 +164,50 @@ gone, replug needed). The owner is not updating the firmware for now.
 
 **Next:** check G HUB as a cause of the holes; a lower `setMaxLag` with a hand over UDP; verify `km.screen` in the UDP reference; the soak runs.
 
+## Partial pass-through of the physical mouse (2026-11-12, UDP, board V4.122)
+
+Owner's goal: part of the hand movement reaches Windows, like aim slowdown on gamepads. The API up to V4.122 has no scale for physical
+movement and no motion stream; `MOVE_MASK 0x16` passes or drops a report per direction. "Lock and re-inject a share" is impossible because
+the board does not count physical movement under a mask. `0x34 MOUSE_HISTORY` and `0x35 RAW_PASSTHROUGH` are listed, format undocumented, not probed.
+
+**Approach A, mask toggling (PWM), works.** Bench: `track_test.exe --pwm 3 --duty 100,75,50,25,0 --pwmperiod 8000` (mask on X, Y free as
+the reference, hand drawing circles). Requested 75 / 50 / 25 % gave **76.8 / 45.9 / 24.6 %**; controls 100 % → 97.5 %, 0 % → 0.0 %. The report
+stream stays intact (~1 ms intervals 96.0–97.3 % against 96.5 % free). The mask takes effect ~1.3 ms after the command in both directions.
+250 `0x16` commands per second, none left hanging, the board answers after the run. Per-second spread is wide (the reference compares X
+with Y over incomplete circles). A one-way run (`--oneway`, mask on +X only, 50 %, periods 6 / 12 / 16 ms) showed 0–1 % of rightward movement in the masked part of the
+period and an even flow in the open part; its percentages (37.6 / 47.3 / 52.9 %) are only estimates, because the free-movement reference was
+skewed (right / left path 1.504, little travel). A both-axes run (`--both --seg 3000`, periods 6 and 12 ms) showed: under a mask on both axes reports still arrive every ms but empty; the
+share is stepped, a whole number of mouse reports per period (1/6 at 6 ms, 1/12 at 12 ms); over UDP a pass or mask window shorter than
+2 ms is not reachable (the bench waits 2 ms after a command, the reference 3 ms), so the usable grid is 33 / 50 / 67 % at 6 ms and
+25 / 50 / 75 % at 8 ms. The percentage of that run is void (the speed-of-hand reference gave 66.6 % on the 100 % control row); the bench
+now uses the share of non-empty Raw Input messages instead. With it (`--both`, periods 8 and 16 ms) the share is exact: 75.0 / 49.9 /
+25.0 % at 8 ms and 74.8 / 49.7 / 24.8 % at 16 ms, control 100.0 %; one unexplained 174.1 ms pause in one segment (hand stop or a report
+hole, the bench cannot tell). By the design of the UDP reference (one command in flight, 3 ms gap after a no-reply command) toggling
+at 8 ms leaves ~2 ms per period for movement packets, so toggling competes with movement packets. Measured with `--assist` (injection pulls the cursor to a point
+next to a red circle through the reference, the hand finishes; mask toggled with `tx.setLocks()`): at a 16 ms period it coexists (hand
+share 49.3 %, 1235 movement records against 1264 without a mask, merged 17.7 % against 7.7 %); at 8 ms injection is starved (34 records,
+99.2 % of `move()` calls merged), because lock commands outrank movement and each is followed by a 3 ms gap and a verify snapshot. A second run gave 47.5 % hand share
+and 33.5 % merged at 12 ms, 50.2 % and 22.3 % at 24 ms, 2.0 % merged without a mask. Four trials per variant, so only a rough comparison;
+the injection tail and step evenness under toggling were not measured. **COM (V4.122), `--pwm --both`:** 50 % holds at a 2 ms period (50.3 %), 75 / 50 / 25 % at 8 ms gave 75.1 / 49.8 / 24.9 %, 75 % at 4 ms
+gave 75.0 %. A pass or mask window shorter than 2 ms is unreliable because reports come once per ms (75 % at 2 ms gave 56.5 %, 25 % at
+4 ms gave 29.2 %). The board survived 1000 `0x16` commands per second for 9 s. Pauses in the report stream so far: 174 ms over UDP,
+142 ms and 11 ms over COM, all in 25 % segments, cause unknown; the bench now prints the travel before and after
+such a pause. **COM with injection (`--assist`, periods 2 / 4 / 8 ms):** injection is not hurt at any period (merged 0–2.7 %,
+all mask commands sent, 1001 per second at 2 ms, no repairs or rejects). The reference sends a verify snapshot after every mask command
+(10 656 lock commands and 10 797 snapshots in the run); long runs under that load are not checked. The hand share after injection was
+measured on only 74–245 messages (54.1 / 48.2 / 48.6 %), because in 10 of 16 trials the hand reached the circle before the pull ended.
+**`setSensitivity(percent)` in the COM reference (2026-11-12):** the watchdog
+toggles the mask itself; 100 / 75 / 50 / 33 / 25 / 10 % requested gave 100.0 / 75.3 / 49.7 / 33.2 / 24.9 / 9.9 %; injection under 50 % kept
+records = messages and a 1.15 ms median tail. Contract and limits: COM reference README. The UDP reference got the same call with mask windows from 6 ms:
+75.6 / 49.8 / 33.6 / 24.4 / 10.0 % measured; injection under 50 % keeps the exact path but gets coarser (25 % merged against 6–7 %).
+Both UDP injection runs were cut short by a board hang, with and without the mask.
+The owner said it "looked strange overall": at 8 ms injection
+came in 8–9 jumps per trial, and the bench keeps pulling to its off-centre point after the hand has already reached the circle. The owner has not rated the feel yet. Not checked: how it feels in a game (movement comes in bursts, 125 per
+second at 8 ms), toggling together with injection, an exact one-way share, COM, long runs, `0x16` losses next to polling or injection.
+
+**Approach B, counter-injection:** not tried; the injection tail with a moving hand (COM 4.5–5.4 ms, UDP 6–9 ms) and the polling hang argue
+against it. **Approach C, ask MAKCU** for a 0–100 % directional mask or a physical motion stream: not sent.
+
 ## What to measure
 
 1. **Accuracy.** Move only the physical mouse and compare Δ`getpos` with the sum of Raw Input deltas over
