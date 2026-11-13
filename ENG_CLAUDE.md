@@ -18,6 +18,11 @@ owner follows the window; cursor-moving tests only in their own clipped window; 
 2. Report holes on COM: 31.8–32.4 or 97.6–112.8 ms vanish while the board reports everything as sent; same rate on revisions 3 and 5; cause unknown.
 3. Tail with a hand moving the mouse: COM 4.5–5.4 ms, UDP 6–9 ms; likely the owner's "3–4 frames" on UDP.
 4. USB3 hang on 4097: during long UDP runs the mouse and network die until the board is replugged. Warn before long UDP runs. With tracking on in the running program it takes minutes over UDP and about 10 minutes over COM: `HANDOFF_UDP_TRACKING_HANG.md`, the next task.
+   **Cause found 2026-11-13 (V4.122, UDP): command rate near the board limit (~530/s).** A bare probe (`udp_soak.exe`) with any opcode hangs it
+   at 510/s in 11-190 s; 350/s hung once at 217 s; 250/s ran 30 min clean. The UDP reference sends packets and polls back-to-back, i.e. at the
+   limit. Fix done and verified 2026-11-13 (three 30-min stress runs without a hang, tail 5.88 ms vs 3.95): UDP revision 6, minimum command period 4 ms
+   (`setCommandPeriodUs`, `effectiveMaxLag` = max(setMaxLag, period + 3) = 7). COM: bare polling at ~5800/s ran 10 min clean; the CH343
+   blue screen was reproduced by the old driver 2.1.2025.7 and did not recur in 30 min on driver 2.2.2026.5.
 5. Not run: COM `--soak 30`, UDP revision 5 `--reconnect` with tracking and `--soak`; G HUB as a cause of the holes.
 6. Blue screen `0xD1` in the CH343 driver on 2026-10-10 and 2026-10-30, same instruction, not a power loss; dumps not analysed: `HANDOFF_UDP_TRACKING_HANG.md`.
 

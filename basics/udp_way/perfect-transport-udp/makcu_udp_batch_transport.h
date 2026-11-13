@@ -12,9 +12,10 @@
 //   - открытие: DEVICE 0x02 (маршрут мыши), FIRMWARE 0x04 (>= 4097), Raw-метаданные
 //     0x6A(id=0), дочистка записей прошлых сессий, поток событий кнопок, сброс
 //     инжектированных кнопок и блокировок (после упавшей программы);
-//   - closed loop: в полёте одна команда; поток приёма по квитанции сразу шлёт
-//     следующий пакет с накопившимися записями (<= 7), X = старший терминальный id из
-//     квитанций (flags bit0) освобождает записи платы;
+//   - closed loop: в полёте одна команда; поток приёма по квитанции шлёт следующий
+//     пакет с накопившимися записями (<= 7), но не раньше чем через 4 мс после прошлой
+//     команды (предел темпа, ревизия 6), X = старший терминальный id из квитанций
+//     (flags bit0) освобождает записи платы;
 //   - непринятые платой записи (нет места) возвращаются в начало очереди;
 //     нет квитанции 30 мс - опрос 0x6A(id=0): last_accepted_id показывает, что принято;
 //   - finish(): дослать очередь, дождаться квитанции, освободить хвост записей;
@@ -76,6 +77,12 @@
 // (колеса - одной 0x17) вместо серии 0x60, пауза после команды без ответа 3 мс.
 // Ревизия 2026-10-30 (5): глубина очереди движения (setMaxLag), stopMovement(),
 // отсчёты физической мыши по позиции платы (setTracking/physical).
+// Ревизия 2026-11-13 (6): нижний предел периода между командами, 4 мс (setCommandPeriodUs).
+// Раньше следующая команда уходила сразу по ответу (~500 пакетов/с при инжекте, ~510 опросов/с
+// при слежении) - это предел платы, и на V4.122 её USB3 зависал за 11-190 с (голая проба
+// probes/udp_soak.exe: любая команда, 510/с и без паузы - обрывы; 250/с - 30 мин чисто).
+// Пакет теперь несёт ~4 записи, инжект 1 кГц; действующий предел глубины не меньше
+// период + 3 записи (effectiveMaxLag), хвост инжекта поэтому длиннее - см. README.
 //
 // Происхождение: basics/udp_way/makcu_udp_transport.h (RawUdpTransport,
 // Format::Batch) от 2026-10-12. Не править: новая версия - новая папка.
@@ -224,6 +231,13 @@ public:
     static constexpr double kInjectSettleUs = 2000.0;     // запас после очереди платы до первого опроса
     static constexpr double kLinkLostUs = 750000.0;       // плата молчит столько - связь потеряна
     static constexpr double kReconnectRetryUs = 250000.0; // попытки переподключения
+    // Нижний предел периода между командами к плате (любыми: 0x6C, 0x63, кнопки, снимки, служебные).
+    // Замер 2026-11-13, V4.122: у предела платы (~530/с, следующая команда сразу по ответу) USB3 платы
+    // зависает за 11-190 с при любой команде; 350/с - один обрыв на 217 с; 250/с - 30 мин чисто.
+    // Инжект остаётся 1 кГц: пакет несёт ~4 записи вместо 2. setCommandPeriodUs() меняет на ходу.
+    static constexpr double kMinCommandPeriodUs = 4000.0;
+    static constexpr double kMovingPollMs = 250.0;        // страховочный опрос 0x55, пока идёт инжект (иначе 50 мс)
+    static constexpr double kMovingHeartbeatUs = 1000000.0;  // пульс-снимок 0x56, пока идёт инжект (иначе 250 мс)
 
     // Снимок счётчиков (stats()).
     struct Stats {
@@ -418,6 +432,15 @@ public:
     [[nodiscard]] uint32_t firmware() const { return firmware_; }
     [[nodiscard]] const std::string& info() const { return info_; }
 
+    // Нижний предел периода между командами к плате, мкс (по умолчанию kMinCommandPeriodUs = 4000, то есть
+    // не больше 250 команд/с). Меньше 4000 на V4.122 вешает плату (см. kMinCommandPeriodUs); 0 - без предела,
+    // как до 2026-11-13. Любой поток, на ходу. Отсчёт - от отправки предыдущей команды; поток приёма просыпается
+    // раз в 1 мс, поэтому фактический период до +1 мс.
+    void setCommandPeriodUs(double us) {
+        cmdPeriodTicks_.store(detail::Qpc::fromUs(std::max(us, 0.0)), std::memory_order_release);
+    }
+    [[nodiscard]] double commandPeriodUs() const { return detail::Qpc::toUs(cmdPeriodTicks_.load(std::memory_order_acquire)); }
+
     // ---- чтение кнопок мыши (любой поток, не блокируют) --------------------------------
     // Маска физических кнопок: bit0 левая, bit1 правая, bit2 средняя, bit3 side1, bit4 side2.
     // Обновляется событием 0x53 сразу по изменению (~1 мс); страховочный опрос 0x55
@@ -575,8 +598,19 @@ public:
     // дорастал до 8 мс. Если оценка очереди дошла до maxLag записей, новая дельта
     // прибавляется к последней неотправленной записи: путь точный, отчётов на один меньше.
     // 0 - не ограничивать (каждый move() - отдельный отчёт).
+    // С пределом темпа команд (setCommandPeriodUs) пакет уходит раз в период и несёт его записи, а оценка
+    // очереди сама держится около "период в мс + 1": предел глубины ниже этого склеивал бы почти каждый
+    // move(), и инжект шёл бы реже 1 кГц. Поэтому действующий предел не меньше ceil(период, мс) + 3
+    // (4 мс -> 7): effectiveMaxLag().
     void setMaxLag(uint32_t records) { maxLag_.store(records, std::memory_order_release); }
     [[nodiscard]] uint32_t maxLag() const { return maxLag_.load(); }
+    [[nodiscard]] uint32_t effectiveMaxLag() const {
+        const uint32_t cap = maxLag_.load(std::memory_order_relaxed);
+        if (!cap) return 0;
+        const double periodMs = commandPeriodUs() / 1000.0;
+        const uint32_t floor = periodMs > 0.0 ? static_cast<uint32_t>(std::ceil(periodMs - 1e-9)) + 3u : 0u;
+        return std::max(cap, floor);
+    }
     // Остановить инжект сейчас: записи, ещё не отправленные плате, выбрасываются - их путь
     // в ПК не попадёт. Пакет в полёте и очередь платы доиграют (отозвать их у платы нельзя).
     // Возвращает число выброшенных записей, в dx/dy - их сумму.
@@ -615,7 +649,7 @@ public:
             const int64_t onBoard = std::max<int64_t>(0, static_cast<int64_t>(boardQueued_) - emitted);
             const auto lag = static_cast<uint32_t>(onBoard + (flight_.active ? flight_.n : 0) + pend_.size());
             st_.maxLag = std::max(st_.maxLag, lag);
-            const uint32_t cap = maxLag_.load(std::memory_order_relaxed);
+            const uint32_t cap = effectiveMaxLag();
             if (cap && lag >= cap && !pend_.empty()) {
                 Rec& last = pend_.back();
                 const int32_t nx = last.dx + dx, ny = last.dy + dy;
@@ -738,13 +772,14 @@ public:
             " | снимков %llu (потеряно %llu), исправлено %llu, поток событий включён заново %llu"
             " | чувствительность %d %%, переключений маски %llu"
             " | связь %s: обрывов %llu, переподключений %llu, посл. обрыв %.0f мс, сброшено записей %llu"
-            " | физика %s: опросов 0x63 %llu, ответов %llu, потеряно %llu, перецентровок %llu, у края %llu",
+            " | физика %s: опросов 0x63 %llu, ответов %llu, потеряно %llu, перецентровок %llu, у края %llu"
+            " | период команд >= %.1f мс",
             endpoint_.c_str(), u(s.records), u(s.packets),
             s.packets ? static_cast<double>(s.records) / static_cast<double>(s.packets) : 0.0, u(s.admitted),
             u(s.receipts), u(s.partial), u(s.envelope), u(s.xRejected), u(s.badReplies), u(s.lostReceipts),
             u(s.metaQueries), u(s.lateReplies), u(s.freed), s.minFree > 255 ? -1 : static_cast<int>(s.minFree),
             u(s.moreSet), u(s.termSubmitted), u(s.termRejected), s.maxPending, s.pending, u(s.busy), s.maxLag,
-            maxLag_.load(), u(s.merged), u(s.stopped), s.maxBoardQueued, s.rttAvgMs,
+            effectiveMaxLag(), u(s.merged), u(s.stopped), s.maxBoardQueued, s.rttAvgMs,
             s.rttMaxMs, u(s.datagrams), u(s.sendErrors), s.lastReason, s.buttons, u(s.buttonEvents),
             u(s.buttonOverflows), u(s.buttonPolls), u(s.buttonReplies), u(s.buttonLost), u(s.buttonMissed),
             u(s.buttonChanges), s.eventsMissing ? " | СОБЫТИЯ НЕ ДОХОДЯТ (брандмауэр?) - опрос 5 мс" : "",
@@ -752,7 +787,7 @@ public:
             u(s.snapshots), u(s.snapshotLost), u(s.repairs), u(s.streamRestores), s.sensitivity, u(s.sensToggles),
             s.connected ? "есть" : "НЕТ",
             u(s.linkLost), u(s.reconnects), s.lastOutageMs, u(s.droppedRecords), s.tracking ? "вкл" : "выкл",
-            u(s.posPolls), u(s.posReplies), u(s.posLost), u(s.recentres), u(s.clamped));
+            u(s.posPolls), u(s.posReplies), u(s.posLost), u(s.recentres), u(s.clamped), commandPeriodUs() / 1000.0);
         return buf;
     }
 
@@ -1025,7 +1060,8 @@ private:
                 // команды без ответа. Пока держим sendMutex_, поток приёма новых не отправит.
                 std::lock_guard<std::mutex> lock(sendMutex_);
                 const int64_t idleBy = detail::Qpc::now() + detail::Qpc::fromUs(kLostUs);
-                while ((awaitSeq_.load(std::memory_order_acquire) != 0 || detail::Qpc::now() < gapUntil_) &&
+                while ((awaitSeq_.load(std::memory_order_acquire) != 0 || detail::Qpc::now() < gapUntil_ ||
+                           tooEarlyLocked(detail::Qpc::now())) &&
                        detail::Qpc::now() < idleBy) {
                     YieldProcessor();
                 }
@@ -1094,6 +1130,7 @@ private:
         n += len;
         const int rc = ::sendto(sock_, reinterpret_cast<const char*>(d.data()), static_cast<int>(n), 0,
             reinterpret_cast<const sockaddr*>(&remote_), sizeof(remote_));
+        lastSendT_ = detail::Qpc::now();  // и неудачная попытка считается: предел темпа важнее
         if (rc != static_cast<int>(n)) {
             sendErrors_.fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -1102,12 +1139,18 @@ private:
         return true;
     }
 
+    // Под sendMutex_: с прошлой команды прошло меньше периода (setCommandPeriodUs) - ждать.
+    [[nodiscard]] bool tooEarlyLocked(int64_t now) const {
+        return now - lastSendT_ < cmdPeriodTicks_.load(std::memory_order_relaxed);
+    }
+
     // Команда без ответа вне цикла (SET 0x52 в open/close): дождаться, пока цикл свободен,
     // отправить и переждать передачу на второй чип.
     bool sendNoReply(uint8_t op, const uint8_t* payload, uint16_t len) {
         std::lock_guard<std::mutex> lock(sendMutex_);
         const int64_t idleBy = detail::Qpc::now() + detail::Qpc::fromUs(kLostUs);
-        while ((awaitSeq_.load(std::memory_order_acquire) != 0 || detail::Qpc::now() < gapUntil_) &&
+        while ((awaitSeq_.load(std::memory_order_acquire) != 0 || detail::Qpc::now() < gapUntil_ ||
+                   tooEarlyLocked(detail::Qpc::now())) &&
                detail::Qpc::now() < idleBy) {
             YieldProcessor();
         }
@@ -1178,6 +1221,7 @@ private:
             return true;
         }
         if (now < gapUntil_) return false;  // после команды без ответа
+        if (tooEarlyLocked(now)) return false;  // предел темпа команд: у предела платы USB3 зависает
 
         // Снимок пришёл: на плате может быть не то, что мы отправляли - разница уйдёт ниже.
         if (snapFresh_.exchange(false, std::memory_order_acq_rel)) {
@@ -1200,8 +1244,17 @@ private:
             streamReenable_ = true;
             return false;
         }
+        // Идёт инжект движения: служебное реже. С пределом темпа каждая служебная команда занимает слот
+        // пакета (4 мс), очередь платы (~4 записи) за это время пустеет - дыра 4-6 мс в выдаче и склейки.
+        // Замер 2026-11-13: опрос 0x55 раз в 50 мс давал дыру каждые 50 мс и ~9 % склеек. Кнопки приходят
+        // событиями 0x53, связь подтверждают квитанции пакетов; сверка после команд (verifyDue_) - как обычно.
+        bool moving = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            moving = !pend_.empty() || flight_.active || now < injectQuietUntil_;
+        }
         // Сверка после команд и пульс связи.
-        if (verifyDue_ || now >= nextSnapT_) {
+        if (verifyDue_ || now >= nextSnapT_ + (moving ? detail::Qpc::fromUs(kMovingHeartbeatUs - kHeartbeatUs) : 0)) {
             verifyDue_ = false;
             nextSnapT_ = now + detail::Qpc::fromUs(kHeartbeatUs);
             const uint64_t ss = ++seq_;
@@ -1237,8 +1290,14 @@ private:
         int64_t poll = pollTicks_.load(std::memory_order_acquire);
         if (poll > 0 && eventsMissing()) poll = std::min(poll, detail::Qpc::fromUs(kFallbackPollMs * 1000.0));
         const bool pollNow = pollNow_.exchange(false, std::memory_order_acq_rel);  // после переполнения потока
-        if (poll > 0 && buttonsOk_.load() && (pollNow || now >= nextPollT_)) {
+        // Во время инжекта страховочный опрос не чаще kMovingPollMs (события 0x53 идут как обычно);
+        // если события не доходят (опрос 5 мс - единственный источник), не реже не делаем.
+        const bool relax = moving && !eventsMissing();
+        const int64_t relaxedPoll = std::max(poll, detail::Qpc::fromUs(kMovingPollMs * 1000.0));
+        const bool pollDue = relax ? now - lastPollT_ >= relaxedPoll : now >= nextPollT_;
+        if (poll > 0 && buttonsOk_.load() && (pollNow || pollDue)) {
             nextPollT_ = now - nextPollT_ > poll ? now + poll : nextPollT_ + poll;  // опоздали - от текущего момента
+            lastPollT_ = now;
             const uint64_t ps = ++seq_;
             physSeq_.store(ps, std::memory_order_release);
             awaitT_.store(now, std::memory_order_relaxed);
@@ -1766,6 +1825,9 @@ private:
     std::atomic<uint64_t> streamSeq_{0};  // nonce проверки потока 0x52
     std::atomic<uint64_t> posSeq_{0};     // nonce опроса позиции 0x63
     int64_t gapUntil_ = 0;                // под sendMutex_: до этого момента не слать (после команды без ответа)
+    int64_t lastSendT_ = 0;               // под sendMutex_: когда ушла последняя команда (предел темпа)
+    int64_t lastPollT_ = 0;               // под sendMutex_: когда ушёл последний опрос 0x55
+    std::atomic<int64_t> cmdPeriodTicks_{detail::Qpc::fromUs(kMinCommandPeriodUs)};  // setCommandPeriodUs()
     int64_t nextPollT_ = 0;               // под sendMutex_: когда следующий опрос кнопок
     int64_t nextSnapT_ = 0;               // под sendMutex_: когда следующий пульс-снимок
     int64_t nextStreamCheckT_ = 0;        // под sendMutex_: когда проверить поток событий

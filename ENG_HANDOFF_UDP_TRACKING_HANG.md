@@ -6,6 +6,30 @@ That weakens the network theory: COM polls about twice as often as UDP (~970/s) 
 **Update 21:30: blue screen in the CH343 driver,** 18 min 38 s into a COM session: `0xD1`, read at `0x38`, IRQL 2. The same crash, same page offset `0x191`, happened on 2026-10-10,
 before tracking existed, so the bug is old; tracking may only make it likelier. Not a power loss. Dumps need admin, the module is unconfirmed: details in the Russian file.
 
+**Update 2026-11-13, V4.122, UDP: the cause is the command rate.** The reference sends the next command right after the reply: `0x6C`
+packets while injecting (~500/s, 2 records each) and `0x63` polls while tracking (~510/s). That is the board's limit (~530/s). Pure injection
+(no mask, no tracking) hung the board at 33 s, tracking alone (zero injected records) at 99 s. A bare probe without the reference,
+`basics/udp_way/probes/udp_soak.exe`: 510/s and back-to-back hung it at 11-190 s with any opcode (`0x02` too); 350/s once clean for 10 min,
+once hung at 217 s; **250/s ran 30 min with zero lost replies** (100/s 10 min clean). 1-3 s of sporadic lost replies precede every hang.
+The mask `0x16` hypothesis is dropped. V4.122 never recovered by itself; the owner replugged every time. Fix (not done): a global minimum
+command period in the UDP reference, candidate 4 ms (250/s). Injection stays 1 kHz with ~4 records per packet; cost about +2-3 ms of tail
+(estimate). Not checked: `0x6C` at 250/s, longer than 30 min, COM. New tools: `track_test --stress S --load inject,sens,track,busy`.
+
+**COM, 2026-11-13.** Bare synchronous polling (`basics/comport_way/com_soak.exe --rate 0`, 10 min, 3.48 M requests, ~5800/s) ran clean:
+the command path itself copes, so the UDP hang lies in the network path (USB NIC on USB3, inter-chip hand-off). Then the game-like
+reference stress (`track_test_com --stress 1800 --load inject,track,busy --burst 200,300`) ran clean for 610 s and the PC blue-screened:
+**`0xD1 (0x38, 2, 0, …6191)`, the same instruction as 10.10 and 30.10, no power blink**, dump `111326-9218-01.dmp`, driver CH343S64.SYS 2.1.2025.7.
+Hypothesis (unproven): a race in the CH343 driver under the reference's overlapped I/O (up to 32 writes in flight plus a pending read with
+a 50 ms timeout); the bare probe does one synchronous op at a time. No debugger on the PC, the dump needs admin.
+The owner then installed **CH343 driver 2.2.2026.5**: the same stress ran **30 min with no blue screen**, 0 link losses, 719 098 records all
+delivered. Then a 60 min run (16:59-17:59): no blue screen, 0 link losses, 1 438 041 records all delivered. **Conclusion: the `0xD1` blue
+screen came from CH343 driver 2.1.2025.7; it does not recur on 2.2.2026.5** (90 min of the load that crashed the old driver at 610 s).
+
+**Fix verified 2026-11-13 evening (V4.122, UDP): reference revision 6** - minimum command period 4 ms, effective depth cap 7, and while
+injecting the 0x55 poll every 250 ms and the 0x56 heartbeat every 1 s. `--stress 1800` with injection (old: hang at 33 s), tracking (old: 99 s)
+and game-like load: **30 min each, 0 link losses, 0 lost receipts**. Injection tail without a hand 5.88 ms (was 3.95), ~980 reports/s, ~2 %
+merged. Not yet: hand on the mouse, `--track 20`, `--trackinject 8`, longer than 30 min, the game.
+
 *Short English summary of [`HANDOFF_UDP_TRACKING_HANG.md`](HANDOFF_UDP_TRACKING_HANG.md), which has the tables, test plan and acceptance criteria.*
 
 **Symptom.** Inside the running program (`verse3_oh`, branch `hand-tracking`, `setTracking(true)` right after `open()`) the board loses USB3:

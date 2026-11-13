@@ -359,6 +359,22 @@ Full tables: [`../MAKCU_RESPONSE_UDP.md`](../MAKCU_RESPONSE_UDP.md), section 4.
 On firmware 4097 the board's USB3 can hang during long movement (mouse and network die until a replug), so `--soak` and `--reconnect` with tracking
 have not been completed on revision 5. No report holes of 12 ms or more in ~230 s, which is not conclusive.
 
+**Hang cause (2026-11-13, V4.122): command rate.** The reference sends the next command right after the reply (`0x6C` ~500/s while injecting,
+`0x63` ~510/s while tracking), which is the board's limit (~530/s). Pure injection hung the board at 33 s, tracking alone at 99 s. The bare
+probe `probes/udp_soak.exe`: 510/s hangs in 11-190 s with any opcode, 350/s hung once at 217 s, **250/s ran 30 min clean**. Fix not done:
+a global minimum command period, candidate 4 ms; injection stays 1 kHz with ~4 records per packet, about +2-3 ms of tail (estimate).
+Details: `HANDOFF_UDP_TRACKING_HANG.md`, "Серия 2026-11-13".
+
+**Revision 6 (2026-11-13), in code, not yet verified on the board:** `kMinCommandPeriodUs = 4000` - every command (0x6C, 0x63, buttons, locks,
+snapshots, service queries) waits at least 4 ms after the previous one (actual 4-5 ms, the rx thread ticks every 1 ms); only the 0x6A meta
+query after a lost receipt is exempt. `setCommandPeriodUs(us)` changes it live, 0 = old behaviour. `effectiveMaxLag()` = max(setMaxLag,
+ceil(period ms) + 3), i.e. 7 at 4 ms, otherwise the old cap 5 would merge almost every move(). Bench: `track_test.exe --cmdperiod US`.
+While injecting, the 0x55 safety poll runs every 250 ms (not 50) and the 0x56 heartbeat every 1 s (not 250 ms): otherwise each poll took a
+packet slot and left a 4-6 ms hole every 50 ms with ~9 % merged.
+**Measured on V4.122 (2026-11-13):** `--inject 3 --dur 300,1000,3000,10000`: tail median 5.88 ms, max 9.88 (rev 5 on 4097: 3.95), ~1.9 %
+merged, 99.3 % 1 ms intervals, ~981 reports/s. `--stress 1800` with injection, with tracking and game-like: 30 min each, no hang (rev 5 hung
+at 33 s and 99 s). Not yet: hand on the mouse, `--withsens`, `controls_test --soak`/`--reconnect`, longer runs, the game. Table: Russian README.
+
 ## Self-check
 
 ```

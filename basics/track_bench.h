@@ -49,6 +49,12 @@
 //   --sens N       [--duty %,%..] [--seg MS] чувствительность через эталон: tx.setSensitivity(%) на
 //                  отрезок (по умолчанию 100,75,50,33,25,10 и 1000 мс), между отрезками 100 %. N кругов.
 //                  Фактическая доля - по сообщениям Raw Input с движением. Водите мышью кругами.
+//   --stress S     [--load inject,sens,track,busy | idle] [--burst ON,OFF] [--withsens %] [--hand] [--slog FILE]
+//                  прогон на стабильность платы: S секунд нагрузка выбранного состава (инжект кругами 1 кГц,
+//                  чувствительность --withsens или 50 %, слежение, клик раз в 2 с + блокировка X+Y на 0.5 с
+//                  раз в 10 с). --burst: инжект порциями ON мс через OFF мс. Строка раз в секунду в журнал
+//                  (fflush, последняя переживёт зависание), раз в 10 с в консоль. Обрыв связи: нагрузка
+//                  снимается, 30 с ожидания самовосстановления, выход с кодом 3. --hand: надпись "водите".
 //
 // Тестовое окно должно быть в фокусе: Raw Input фонового окна Windows 11 прореживает.
 // Курсор заперт в окне. Esc - выход; блокировки снимаются и проверяются снимком 0x56.
@@ -119,6 +125,10 @@ struct RawEv {
 constexpr size_t kRawCap = size_t{1} << 20;  // ~17 мин при 1 кГц
 std::vector<RawEv> g_raw(kRawCap);
 std::atomic<size_t> g_rawN{0};
+std::atomic<uint64_t> g_rawTotal{0};              // все сообщения, без предела kRawCap
+std::atomic<int64_t> g_rawSumX{0}, g_rawSumY{0};  // путь всех сообщений
+std::atomic<int64_t> g_rawLastT{0};               // QPC последнего сообщения
+std::atomic<int64_t> g_rawMaxGap{0};              // наибольшая пауза, QPC (--stress сбрасывает раз в секунду)
 
 struct Ui {
     HWND hwnd = nullptr;
@@ -180,6 +190,13 @@ LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) !=
                 static_cast<UINT>(-1) &&
             raw.header.dwType == RIM_TYPEMOUSE && !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+            // --stress: счёт без предела буфера, сумма пути и наибольшая пауза между сообщениями.
+            g_rawTotal.fetch_add(1, std::memory_order_relaxed);
+            g_rawSumX.fetch_add(raw.data.mouse.lLastX, std::memory_order_relaxed);
+            g_rawSumY.fetch_add(raw.data.mouse.lLastY, std::memory_order_relaxed);
+            if (const int64_t prev = g_rawLastT.exchange(now, std::memory_order_relaxed); prev) {
+                if (now - prev > g_rawMaxGap.load(std::memory_order_relaxed)) g_rawMaxGap.store(now - prev, std::memory_order_relaxed);
+            }
             const size_t n = g_rawN.load(std::memory_order_relaxed);
             if (n < kRawCap) {
                 g_raw[n] = RawEv{now, raw.data.mouse.lLastX, raw.data.mouse.lLastY, raw.header.hDevice};
@@ -1864,13 +1881,179 @@ int runSens(int rounds) {
     }
 }
 
+// ---- --stress ----------------------------------------------------------------------------
+// Долгий прогон на стабильность платы: нагрузка выбранного состава, строка раз в секунду в файл
+// (fflush после каждой, чтобы последняя пережила зависание) и раз в 10 с в консоль. На обрыве
+// связи нагрузка снимается, стенд ждёт до 30 с, вернётся ли плата сама (V4.122 обещает
+// самовосстановление USB3), и выходит.
+std::string g_stressLoad = "inject";  // --load inject,sens,track,busy (через запятую; idle - ничего)
+std::vector<int> g_burst;             // --burst ON,OFF: инжект порциями, мс (пусто - непрерывно)
+std::string g_stressLog;              // --slog FILE (пусто - stress_ДАТА_ВРЕМЯ.log в текущей папке)
+bool g_hand = false;                  // --hand: рука водит (надпись окна), иначе "не трогайте"
+
+inline bool stressHas(const char* k) {
+    return ("," + g_stressLoad + ",").find(std::string(",") + k + ",") != std::string::npos;
+}
+
+template <class T>
+int runStress(double seconds) {
+    const bool inj = stressHas("inject"), sens = stressHas("sens"), track = stressHas("track"), busy = stressHas("busy");
+    typename T::Tx tx;
+    std::string err;
+    if (!T::open(tx, err)) {
+        std::printf("[-] %s\n", err.c_str());
+        return 1;
+    }
+    SYSTEMTIME lt;
+    GetLocalTime(&lt);
+    char path[96];
+    if (g_stressLog.empty()) {
+        std::snprintf(path, sizeof(path), "stress_%04u%02u%02u_%02u%02u%02u.log", lt.wYear, lt.wMonth, lt.wDay, lt.wHour,
+            lt.wMinute, lt.wSecond);
+        g_stressLog = path;
+    }
+    FILE* lf = std::fopen(g_stressLog.c_str(), "a");
+    auto out = [&](bool console, const char* fmt, auto... args) {
+        char line[512];
+        std::snprintf(line, sizeof(line), fmt, args...);
+        if (console) {
+            std::fputs(line, stdout);
+            std::fflush(stdout);
+        }
+        if (lf) {
+            std::fputs(line, lf);
+            std::fflush(lf);
+        }
+    };
+    auto clock = [] {
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        static char s[16];
+        std::snprintf(s, sizeof(s), "%02u:%02u:%02u", t.wHour, t.wMinute, t.wSecond);
+        return std::string(s);
+    };
+    const int sensPct = g_withSens < 100 ? g_withSens : 50;
+    out(true, "[+] эталон: %s\n", tx.info().c_str());
+    out(true, "[+] --stress %.0f с, старт %s, нагрузка: %s%s%s%s%s, порции %s, рука: %s, журнал %s\n", seconds, clock().c_str(),
+        inj ? "инжект 1 кГц " : "", sens ? "чувствительность " : "", track ? "слежение " : "", busy ? "клики+блокировки " : "",
+        (inj || sens || track || busy) ? "" : "простой", g_burst.size() >= 2 ? (std::to_string(g_burst[0]) + "/" + std::to_string(g_burst[1]) + " мс").c_str() : "нет",
+        g_hand ? "водит" : "не трогать", g_stressLog.c_str());
+    if (sens) {
+        applySens(tx, sensPct);
+        out(true, "[+] чувствительность %d %%%s\n", sensPct, HasSens<typename T::Tx>::value ? "" : " - НЕТ в этом эталоне");
+    }
+    if (track && !tx.setTracking(true)) out(true, "[-] setTracking(true) не прошёл\n");
+    static const wchar_t* const kHintInj = L"прогон на стабильность: курсор ходит кругами; Esc - досрочно";
+    static const wchar_t* const kHintIdle = L"прогон на стабильность; Esc - досрочно";
+    say(g_hand ? L"ВОДИТЕ МЫШЬЮ КРУГАМИ, НЕ ОСТАНАВЛИВАЯСЬ" : L"НЕ ТРОГАЙТЕ МЫШЬ", inj ? kHintInj : kHintIdle);
+    sleepMs(1500.0);
+    out(true, "время    |    с | move/с | Raw/с | max пауза Raw, мс | записей | склеено | 0x63 отв./с | маска/с | связь | обрывов | окно в фокусе\n");
+    const auto s0 = tx.stats();
+    const uint64_t raw0 = g_rawTotal.load();
+    const int64_t sx0 = g_rawSumX.load(), sy0 = g_rawSumY.load();
+    const int64_t t0 = Q::now(), sec = Q::fromUs(1e6);
+    int64_t due = t0, nextRep = t0 + sec, lostAt = 0;
+    int64_t sentX = 0, sentY = 0, pendX = 0, pendY = 0;
+    uint64_t moves = 0, movesPrev = 0, rawPrev = raw0, posPrev = s0.posReplies, togPrev = s0.sensToggles;
+    double phase = 0.0, fx = 0.0, fy = 0.0;
+    int silentS = 0, rep = 0;
+    bool rawSilentNoted = false, back = false;
+    g_rawMaxGap.store(0);
+    for (uint64_t tick = 0; !g_stop.load(); ++tick) {
+        spinUntil(due);
+        due += Q::fromUs(1000.0);
+        const int64_t now = Q::now();
+        if (!lostAt && now - t0 >= Q::fromUs(seconds * 1e6)) break;
+        if (busy && !lostAt) {
+            using makcu::LockTarget;
+            if (tick % 2000 == 1000) tx.press(makcu::MouseButton::Left);
+            if (tick % 2000 == 1040) tx.release(makcu::MouseButton::Left);
+            if (tick % 10000 == 5000) tx.setLocks({LockTarget::X, LockTarget::Y}, true);
+            if (tick % 10000 == 5500) tx.unlockAll();
+        }
+        bool on = inj && !lostAt;
+        if (on && g_burst.size() >= 2 && g_burst[0] + g_burst[1] > 0) {
+            on = static_cast<int>(tick % static_cast<uint64_t>(g_burst[0] + g_burst[1])) < g_burst[0];
+        }
+        if (on) {
+            const double r = 120.0, w = 2.0 * 3.14159265358979 / 300.0;
+            fx += -r * w * std::sin(phase);
+            fy += r * w * std::cos(phase);
+            phase += w;
+            const int64_t ix = std::llround(fx), iy = std::llround(fy);
+            fx -= static_cast<double>(ix);
+            fy -= static_cast<double>(iy);
+            pendX += ix;
+            pendY += iy;
+            if ((pendX || pendY) && tx.move(static_cast<int16_t>(pendX), static_cast<int16_t>(pendY))) {
+                ++moves;
+                sentX += pendX;
+                sentY += pendY;
+                pendX = pendY = 0;
+            }
+        }
+        if (now < nextRep) continue;
+        nextRep += sec;
+        ++rep;
+        const auto st = tx.stats();
+        const uint64_t raw = g_rawTotal.load();
+        const double gapMs = Q::toUs(g_rawMaxGap.exchange(0)) / 1000.0;
+        const double el = Q::toUs(now - t0) / 1e6;
+        const uint64_t mv = moves - movesPrev, rw = raw - rawPrev;
+        out(rep % 10 == 0 || lostAt, "%s | %4.0f | %6llu | %5llu | %17.1f | %7llu | %7llu | %11llu | %7llu | %5s | %7llu | %s\n", clock().c_str(), el,
+            static_cast<unsigned long long>(mv), static_cast<unsigned long long>(rw), gapMs,
+            static_cast<unsigned long long>(T::records(st) - T::records(s0)), static_cast<unsigned long long>(T::merged(st) - T::merged(s0)),
+            static_cast<unsigned long long>(st.posReplies - posPrev), static_cast<unsigned long long>(st.sensToggles - togPrev),
+            st.connected ? "да" : "НЕТ", static_cast<unsigned long long>(st.linkLost - s0.linkLost),
+            foreground() ? "да" : "НЕТ (Raw Input прорежен)");
+        // Инжект шёл всю секунду, а Raw Input молчит: мышь в ПК умерла раньше, чем транспорт заметил.
+        if (inj && !lostAt && g_burst.empty() && mv > 500 && rw == 0) {
+            ++silentS;
+            if (!rawSilentNoted) {
+                out(true, "[!] %s, %.0f с: move() идут (%llu/с), а Raw Input молчит\n", clock().c_str(), el, static_cast<unsigned long long>(mv));
+                rawSilentNoted = true;
+            }
+        }
+        movesPrev = moves;
+        rawPrev = raw;
+        posPrev = st.posReplies;
+        togPrev = st.sensToggles;
+        if (!lostAt && st.linkLost != s0.linkLost) {
+            lostAt = now;
+            out(true, "[!] ОБРЫВ СВЯЗИ %s, на %.1f с прогона (нагрузка снята, жду до 30 с, вернётся ли плата сама)\n", clock().c_str(), el);
+        } else if (lostAt && st.reconnects != s0.reconnects) {
+            out(true, "[+] плата вернулась сама через %.1f с после обрыва (обрыв по транспорту %.0f мс)\n",
+                Q::toUs(now - lostAt) / 1e6, st.lastOutageMs);
+            back = true;
+            break;
+        } else if (lostAt && now - lostAt > Q::fromUs(30e6)) {
+            out(true, "[-] за 30 с плата не вернулась: нужна перезагрузка (переподключение) платы\n");
+            break;
+        }
+    }
+    const double total = Q::toUs(Q::now() - t0) / 1e6;
+    const int64_t wx = g_rawSumX.load() - sx0, wy = g_rawSumY.load() - sy0;
+    out(true, "%s\n", tx.statsLine().c_str());
+    out(true, "итог %s: %.0f с, обрывов %llu%s, move() %llu, отправлено %+lld,%+lld, Windows %+lld,%+lld%s, Raw Input сообщений %llu, "
+              "секунд с немым Raw Input %d\n", clock().c_str(), total, static_cast<unsigned long long>(tx.stats().linkLost - s0.linkLost),
+        lostAt ? (back ? " (вернулась сама)" : " (не вернулась)") : "", static_cast<unsigned long long>(moves),
+        static_cast<long long>(sentX), static_cast<long long>(sentY), static_cast<long long>(wx), static_cast<long long>(wy),
+        g_hand ? " (рука водила: путь не сравнивается)" : (wx == sentX && wy == sentY ? " (совпал)" : " <-- путь не совпал"),
+        static_cast<unsigned long long>(g_rawTotal.load() - raw0), silentS);
+    if (track) tx.setTracking(false);
+    tx.close();
+    say(L"ГОТОВО");
+    if (lf) std::fclose(lf);
+    return lostAt ? 3 : 0;
+}
+
 // ---- разбор ключей и запуск: общее для UDP- и COM-стенда ---------------------------------
 struct Args {
-    double accuracyS = 0.0, trackS = 0.0, lossS = 0.0;
+    double accuracyS = 0.0, trackS = 0.0, lossS = 0.0, stressS = 0.0;
     int lockN = 0, injectN = 0, refLockN = 0, trackInjectN = 0, pwmN = 0, assistN = 0, sensN = 0;
     bool any() const {
         return accuracyS > 0.0 || lockN > 0 || injectN > 0 || lossS > 0.0 || refLockN > 0 || trackS > 0.0 ||
-            trackInjectN > 0 || pwmN > 0 || assistN > 0 || sensN > 0;
+            trackInjectN > 0 || pwmN > 0 || assistN > 0 || sensN > 0 || stressS > 0.0;
     }
 };
 
@@ -1903,6 +2086,11 @@ inline bool parseArg(Args& a, int& i, int argc, char** argv) {
     else if (std::strcmp(k, "--assist") == 0 && more) a.assistN = std::atoi(argv[++i]);
     else if (std::strcmp(k, "--sens") == 0 && more) a.sensN = std::atoi(argv[++i]);
     else if (std::strcmp(k, "--withsens") == 0 && more) g_withSens = std::atoi(argv[++i]);
+    else if (std::strcmp(k, "--stress") == 0 && more) a.stressS = std::atof(argv[++i]);
+    else if (std::strcmp(k, "--load") == 0 && more) g_stressLoad = argv[++i];
+    else if (std::strcmp(k, "--burst") == 0 && more) parseList(argv[++i], g_burst);
+    else if (std::strcmp(k, "--slog") == 0 && more) g_stressLog = argv[++i];
+    else if (std::strcmp(k, "--hand") == 0) g_hand = true;
     else if (std::strcmp(k, "--duty") == 0 && more) parseList(argv[++i], g_pwmDuty);
     else if (std::strcmp(k, "--pwmperiod") == 0 && more) parseList(argv[++i], g_pwmPeriodUs);
     else if (std::strcmp(k, "--oneway") == 0) g_pwmOneWay = true;
@@ -1949,6 +2137,8 @@ int benchMain(const Args& a) {
         rc = runAssist<T>(a.assistN);
     } else if (a.sensN > 0) {
         rc = runSens<T>(a.sensN);
+    } else if (a.stressS > 0.0) {
+        rc = runStress<T>(a.stressS);
     } else {
         typename T::Board b;
         std::string err;

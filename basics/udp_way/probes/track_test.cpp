@@ -170,11 +170,18 @@ private:
 
 std::string g_host = "auto";
 uint16_t g_port = 8080;
+double g_cmdPeriodUs = -1.0;  // --cmdperiod US: tx.setCommandPeriodUs() (-1 - как в эталоне, 4000)
 
 struct Udp {
     using Tx = makcu::UdpBatchTransport;
     using Board = ::Board;
-    static bool open(Tx& tx, std::string& err) { return tx.open(g_host, g_port, err); }
+    static bool open(Tx& tx, std::string& err) {
+        if (g_cmdPeriodUs >= 0.0) tx.setCommandPeriodUs(g_cmdPeriodUs);
+        const bool ok = tx.open(g_host, g_port, err);
+        if (ok) std::printf("[+] период команд эталона >= %.1f мс, действующий предел глубины %u\n", tx.commandPeriodUs() / 1000.0,
+            tx.effectiveMaxLag());
+        return ok;
+    }
     static bool openBoard(Board& b, std::string& err) { return b.open(g_host, g_port, err); }
     static uint32_t depth(const Tx::Stats& s) { return s.maxBoardQueued; }
     static uint64_t merged(const Tx::Stats& s) { return s.merged; }
@@ -188,11 +195,12 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     Args a;
     auto usage = [] {
-        std::printf("track_test.exe [--host auto|IP|MAC] --accuracy S | --lock N | --lockloss S | --inject N | --reflock N | --track S | --trackinject N | --pwm N [--duty %%,..] [--pwmperiod US,..] [--oneway | --both] [--seg MS] | --assist N [--duty %%] [--pwmperiod US,..] | --sens N [--duty %%,..] [--seg MS]\n");
+        std::printf("track_test.exe [--host auto|IP|MAC] [--cmdperiod US] --accuracy S | --lock N | --lockloss S | --inject N | --reflock N | --track S | --trackinject N | --pwm N [--duty %%,..] [--pwmperiod US,..] [--oneway | --both] [--seg MS] | --assist N [--duty %%] [--pwmperiod US,..] | --sens N [--duty %%,..] [--seg MS] | --stress S [--load inject,sens,track,busy|idle] [--burst ON,OFF] [--withsens %%] [--hand] [--slog FILE]\n");
         return 2;
     };
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) g_host = argv[++i];
+        else if (std::strcmp(argv[i], "--cmdperiod") == 0 && i + 1 < argc) g_cmdPeriodUs = std::atof(argv[++i]);
         else if (!parseArg(a, i, argc, argv)) return usage();
     }
     if (!a.any()) return usage();
