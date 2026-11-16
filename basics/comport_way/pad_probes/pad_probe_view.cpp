@@ -12,7 +12,12 @@
 //            с --rate 0 COM не занимает и показывает в круге "Windows, правый" то, что они инжектят.
 //   красная  "ГЕЙМПАД ПРОПАЛ в ЧЧ:ММ:СС. Обрывов: N. Жду, когда вернётся"
 //   красная  "ГЕЙМПАД МОЛЧИТ с ЧЧ:ММ:СС: подключён, но отчётов нет. Переподключи кабель геймпада"  (пакетов нет 2 с)
+//   --notouch: при отказе "ГЕЙМПАД МОЛЧИТ с ЧЧ:ММ:СС. Ничего не трогай: жди сообщения в чате" и
+//              "ГЕЙМПАД ПРОПАЛ в ЧЧ:ММ:СС. Ничего не трогай: жди сообщения в чате" (сначала снимок платы, потом руки)
 //   красная  "Геймпада в Windows нет. Подключи геймпад"           (с самого старта не появлялся)
+//   --watch (рядом pad_drop_watch.ps1): зелёная "Крути ПРАВЫЙ стик кругами без перерыва. Донгл и провода НЕ трогай. На месте M:SS, обрывов: N";
+//            после отказа 40 с красная "ГЕЙМПАД ПРОПАЛ|МОЛЧИТ в ЧЧ:ММ:СС. НИЧЕГО НЕ ТРОГАЙ ещё N с: опрашиваю плату",
+//            затем "ГЕЙМПАД ПРОПАЛ|МОЛЧИТ в ЧЧ:ММ:СС. Плата опрошена. Ничего не перевтыкай, жди сообщения в чате"
 //   чёрная   "ГОТОВО. Окно закроется само"
 // Под надписью: "осталось N с". Нижние строки: состояние платы и Windows, пакетов/с, время последнего события.
 // Esc или крестик - выход раньше срока.
@@ -96,7 +101,11 @@ int main(int argc, char** argv) {
     std::string port = "COM5", logPath;
     double dur = 600.0, rate = 0.0;
     bool noTouch = false;  // рядом идёт программа, которая инжектит стик (example_pad, pad_bench_com): надпись "НЕ ТРОГАЙ"
+    // --keepalive: то же, но геймпад по радио может уснуть без касаний (инжект он не чувствует), поэтому владелец раз в
+    // 20 с качает ЛЕВЫЙ стик (ступени pad_soak его не используют). 2026-11-16.
+    bool keepAlive = false;
     bool press = false;    // --press: проверка кнопок рукой (рядом example_pad --buttons): надпись "Нажимай ЗАДНИЕ кнопки..."
+    bool watch = false;    // --watch: рядом pad_drop_watch.ps1 ловит отказ и опрашивает плату по COM ~40 с после него
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const bool more = i + 1 < argc;
@@ -105,9 +114,11 @@ int main(int argc, char** argv) {
         else if (a == "--dur" && more) dur = std::atof(argv[++i]);
         else if (a == "--log" && more) logPath = argv[++i];
         else if (a == "--notouch") noTouch = true;
+        else if (a == "--keepalive") noTouch = keepAlive = true;
         else if (a == "--press") press = true;
+        else if (a == "--watch") watch = true;
         else {
-            std::printf("pad_probe_view.exe [--port COM5] [--rate 0|N] [--dur 600] [--log FILE] [--notouch | --press]\n");
+            std::printf("pad_probe_view.exe [--port COM5] [--rate 0|N] [--dur 600] [--log FILE] [--notouch | --keepalive | --press | --watch]\n");
             return 2;
         }
     }
@@ -149,6 +160,7 @@ int main(int argc, char** argv) {
         return std::wstring(s.begin(), s.end());  // только цифры и двоеточия
     };
     std::wstring lastEvent = L"нет", lostAt, silentAt;
+    int64_t lostT = t0, silentT = t0;  // когда пропал / замолчал (для отсчёта --watch)
     // "Молчит": Windows считает геймпад подключённым, но номер пакета XInput не растёт дольше 2 с. У GameSir номер
     // растёт ~1000 раз/с и в покое, поэтому тишина = геймпад завис (так было 2026-11-14 22:13 при инжекте с Off:
     // плата отвечала kinds 82 и отдавала застывший снимок 0x54, стики не двигались, помогло переподключение кабеля).
@@ -173,6 +185,7 @@ int main(int argc, char** argv) {
                 if (everXi) {
                     ++drops;
                     lostAt = wclock();
+                    lostT = t;
                     lastEvent = L"ПРОПАЛ в " + lostAt;
                 }
                 silent = false;
@@ -194,6 +207,7 @@ int main(int argc, char** argv) {
                 silent = true;
                 ++silences;
                 silentAt = wclock();
+                silentT = t;
                 out("[!] %s (%.1f с) Windows: геймпад подключён, но МОЛЧИТ (пакетов нет 2 с)\n", clockStr().c_str(), sec);
                 lastEvent = L"ЗАМОЛЧАЛ в " + silentAt;
             }
@@ -218,16 +232,32 @@ int main(int argc, char** argv) {
             }
             which ^= 1;
             COLORREF color = RGB(200, 0, 0);
-            if (xiOk == 1 && silent) {
-                swprintf(hint[which], 160, L"ГЕЙМПАД МОЛЧИТ с %ls: подключён, но отчётов нет. Переподключи кабель геймпада", silentAt.c_str());
+            // --watch: после отказа 40 с "НИЧЕГО НЕ ТРОГАЙ" с отсчётом (pad_drop_watch.ps1 в это время делает три снимка платы:
+            // сразу, через 10 и через 30 с, каждый ~2.5 с), потом "плата опрошена, жди сообщения в чате".
+            const bool badNow = (xiOk == 1 && silent) || (xiOk != 1 && everXi);
+            if (watch && badNow) {
+                const bool sil = xiOk == 1 && silent;
+                const int left = 40 - static_cast<int>(toMs(t - (sil ? silentT : lostT)) / 1000.0);
+                if (left > 0)
+                    swprintf(hint[which], 160, L"ГЕЙМПАД %ls в %ls. НИЧЕГО НЕ ТРОГАЙ ещё %d с: опрашиваю плату", sil ? L"МОЛЧИТ" : L"ПРОПАЛ",
+                             (sil ? silentAt : lostAt).c_str(), left);
+                else
+                    swprintf(hint[which], 160, L"ГЕЙМПАД %ls в %ls. Плата опрошена. Ничего не перевтыкай, жди сообщения в чате",
+                             sil ? L"МОЛЧИТ" : L"ПРОПАЛ", (sil ? silentAt : lostAt).c_str());
+            } else if (xiOk == 1 && silent) {
+                if (noTouch) swprintf(hint[which], 160, L"ГЕЙМПАД МОЛЧИТ с %ls. Ничего не трогай: жди сообщения в чате", silentAt.c_str());
+                else swprintf(hint[which], 160, L"ГЕЙМПАД МОЛЧИТ с %ls: подключён, но отчётов нет. Переподключи кабель геймпада", silentAt.c_str());
             } else if (xiOk == 1) {
                 const int up = static_cast<int>(toMs(t - upSince) / 1000.0);
-                if (press) swprintf(hint[which], 160, L"Нажимай ЗАДНИЕ кнопки геймпада по очереди, каждую по 3 раза. Потом A и правый триггер");
+                if (watch) swprintf(hint[which], 160, L"Крути ПРАВЫЙ стик кругами без перерыва. Донгл и провода НЕ трогай. На месте %d:%02d, обрывов: %d", up / 60, up % 60, drops);
+                else if (press) swprintf(hint[which], 160, L"Нажимай ЗАДНИЕ кнопки геймпада по очереди, каждую по 3 раза. Потом A и правый триггер");
+                else if (keepAlive) swprintf(hint[which], 160, L"Правый стик, RT и A НЕ трогай: их двигает программа. Раз в 20 с качни ЛЕВЫЙ стик. На месте %d:%02d, обрывов: %d", up / 60, up % 60, drops);
                 else if (noTouch) swprintf(hint[which], 160, L"НЕ ТРОГАЙ геймпад: стик и кнопки двигает программа. На месте %d:%02d, обрывов: %d", up / 60, up % 60, drops);
                 else swprintf(hint[which], 160, L"Геймпад на месте %d:%02d. Обрывов: %d. Стики можно крутить", up / 60, up % 60, drops);
                 color = noTouch ? RGB(200, 90, 0) : RGB(0, 130, 0);
             } else if (everXi) {
-                swprintf(hint[which], 160, L"ГЕЙМПАД ПРОПАЛ в %ls. Обрывов: %d. Жду, когда вернётся", lostAt.c_str(), drops);
+                if (noTouch) swprintf(hint[which], 160, L"ГЕЙМПАД ПРОПАЛ в %ls. Ничего не трогай: жди сообщения в чате", lostAt.c_str());
+                else swprintf(hint[which], 160, L"ГЕЙМПАД ПРОПАЛ в %ls. Обрывов: %d. Жду, когда вернётся", lostAt.c_str(), drops);
             } else {
                 swprintf(hint[which], 160, L"Геймпада в Windows нет. Подключи геймпад");
             }

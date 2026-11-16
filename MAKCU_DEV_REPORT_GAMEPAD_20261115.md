@@ -1,3 +1,5 @@
+> **Superseded 2026-11-16 by `MAKCU_DEV_REPORT_GAMEPAD_20261116.md` + `basics/comport_way/makcu_gamepad_com_test.zip`. Not sent.**
+
 # Controller on USB3 stops reporting / disappears while the PC talks to MAKCU over COM (V4.126)
 
 ## Setup
