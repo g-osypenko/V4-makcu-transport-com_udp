@@ -1,4 +1,8 @@
-// MAKCU: PadTextureRenderer - рендерер аппаратной текстуры стика геймпада. Ревизия 3 (2026-11-15).
+// MAKCU: PadTextureRenderer - рендерер аппаратной текстуры стика геймпада. Ревизия 4 (2026-11-17).
+//
+// РЕВИЗИЯ 4: presetForTransport(kind, boardOff, tx.commandPeriodUs(), tx.padCadenceUs()) - пресет под режим платы и
+// под интервал геймпада (125 / 250 / 500 / 1000 Гц): такт = период команд, модель АЦП подгоняется под такт.
+// Пользоваться им вместо presetOff() / presetFor() + ручного tick_hz. HANDOFF_GAMEPAD_COM.md, 9к.
 //
 // ДВА РЕЖИМА. Описание ниже (такт 2 мс, опережение, шесть каскадов) - для сглаживания платы Auto: presetFor().
 // При сглаживании платы Off плата - чистая задержка 4-5 мс и каждая команда раз в 1 мс доходит как есть; для него
@@ -227,6 +231,36 @@ public:
         pr.finalize();
         return pr;
     }
+    // Период выборки АЦП в модели presetOff(): замер GameSir XInput (1000 отчётов/с, выборка раз в 2 мс, отчёт между
+    // выборками - середина). Для других геймпадов не измерен.
+    static constexpr double kAdcSampleUs = 2000.0;
+
+    // Пресет под транспорт (ревизия 4, 2026-11-17): выбирает presetOff() / presetFor() по режиму платы и подгоняет такт
+    // под период команд транспорта (tx.commandPeriodUs(), с ревизии 3 транспорта он не короче интервала геймпада):
+    //   tick_hz = 1e6 / commandPeriodUs; update_rate_hz = 1e6 / padCadenceUs (если известен);
+    //   модель АЦП (presetOff): выборка раз в round(2 мс / период) тактов; если такт уже 2 мс и длиннее (геймпад 125 /
+    //   250 / 500 Гц), каждый такт - свежая выборка, без середины и без пачек "без середины" (они - свойство 1000-Гц
+    //   GameSir между выборками).
+    // Просто поставить prof.tick_hz нельзя: presetOff() держит adc_period_ticks = 2 под такт 1 мс, и при такте 8 мс
+    // модель брала бы выборку раз в 16 мс с серединой. На геймпадах медленнее 1000 Гц НЕ ПРОВЕРЕНО; опережение
+    // presetFor() (kappa_lead под цикл интерполятора 2 мс при Auto) при такте длиннее 2 мс - тоже.
+    static PadRendererProfile presetForTransport(uint8_t controllerKind, bool boardOff, double commandPeriodUs, double padCadenceUs = 0.0) {
+        PadRendererProfile pr = boardOff ? presetOff(controllerKind) : presetFor(controllerKind);
+        const double period = std::max(250.0, commandPeriodUs);
+        pr.tick_hz = static_cast<float>(1e6 / period);
+        if (padCadenceUs > 0.0) pr.regime.update_rate_hz = static_cast<float>(1e6 / padCadenceUs);
+        if (pr.regime.raw_lsb > 0.0f) {
+            const long ticks = std::clamp(std::lround(kAdcSampleUs / period), 1L, 255L);
+            pr.regime.adc_period_ticks = static_cast<uint8_t>(ticks);
+            if (ticks < 2) {
+                pr.regime.adc_midpoint = false;
+                pr.regime.adc_stale_start = 0.0f;
+            }
+        }
+        pr.finalize();
+        return pr;
+    }
+
     // Пресет по kinds & 0xFC из DEVICE (0x02).
     static PadRendererProfile presetFor(uint8_t controllerKind) {
         PadRendererProfile pr = preset((controllerKind & 0x38) ? Preset::Sony8bit : (controllerKind & 0x40) ? Preset::Xbox10bit : Preset::XInput16bit);

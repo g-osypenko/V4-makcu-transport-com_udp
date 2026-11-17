@@ -1,7 +1,16 @@
-// MAKCU: транспорт геймпада по COM (USB2, CH343, 4 Мбод) - эталон, ревизия 2 (2026-11-15).
+// MAKCU: транспорт геймпада по COM (USB2, CH343, 4 Мбод) - эталон, ревизия 3 (2026-11-17).
 //
 // Один заголовок, C++20, без зависимостей кроме WinAPI (SetupAPI для поиска порта).
 // Проверено на плате V4.122 с геймпадом GameSir в режиме XInput (kinds 0x82), interpolation = auto, буфер 8 мс.
+//
+// РЕВИЗИЯ 3: ГЕЙМПАДЫ 125 / 250 / 500 / 1000 ГЦ (HANDOFF_GAMEPAD_COM.md, 9к). Клон на плате объявляет Windows тот же
+// интервал опроса, что и настоящий геймпад (cadence в 0x54), поэтому:
+//   - период команд не короче интервала геймпада: commandPeriodUs() = max(период режима или заданный, padCadenceUs());
+//   - опрос 0x54 по умолчанию max(2 мс, интервал геймпада) вместо 0.5 мс: 500 запросов/с на 1000-Гц геймпаде
+//     (2000 запросов/с ронял USB3 платы: V4.126 5 из 5, 4133 раз за ~15 мин), меньше на медленных;
+//   - padCadenceUs(), padReportRate() (измеренная частота), в Stats и statsLine() - интервал, частота и оба периода.
+// На настоящем геймпаде 125 / 250 / 500 Гц НЕ ПРОВЕРЕНО (у нас только GameSir с cadence 1 мс). Сборка 2026-11-17 на
+// плате ещё не запускалась.
 //
 // РЕВИЗИЯ 2: РАБОТА ПРИ СГЛАЖИВАНИИ ПЛАТЫ OFF (HANDOFF_GAMEPAD_COM.md, 9б-9е). Описание ниже написано для Auto;
 // при Off плата - чистая задержка 4-5 мс, каждая команда раз в 1 мс доходит как есть, а вход в инжект и отпускание -
@@ -51,7 +60,8 @@
 // Побочный эффект платы: пока идут команды, физический геймпад читается ~500 раз/с вместо 1000 (dt 1 и 3 мс).
 //
 // Ввод-вывод: один рабочий поток, синхронный порт, такт 500 мкс. В начале такта читается всё, что пришло
-// (без ожидания), в конце уходят запросы (GET 0x54 каждый такт, SET 0x40 каждый 4-й, GET 0x40 раз в 250 мс);
+// (без ожидания), в конце уходят запросы (GET 0x54 раз в physicalPollUs(), SET 0x40 раз в commandPeriodUs(),
+// GET 0x40 раз в 250 мс);
 // ответы разбираются на следующем такте. Поток не ждёт порт и не пользуется тайм-аутами драйвера.
 // ТАЙМ-АУТЫ ЧТЕНИЯ COM-ПОРТА НЕ ИСПОЛЬЗОВАТЬ: первая версия с ожиданием первого байта до 2 мс 2026-11-14 дала
 // синий экран 0xD1 в CH343S64.SYS 2.2.2026.5 через ~12 тыс. запросов (README, "Синий экран в драйвере CH343").
@@ -232,7 +242,15 @@ public:
     static constexpr double kOffBlendEnterMs = 16.0;           // плавный вход при Off (при Auto плата сглаживает сама ~12 мс)
     static constexpr double kOffBlendExitMs = 24.0;            // плавный выход при Off
     static constexpr double kPadKeepaliveUs = 100000.0;        // повтор удерживаемых кнопок и триггеров, пока стик не перехвачен
-    static constexpr double kTickUs = 500.0;                  // такт рабочего потока: запрос 0x54 каждый такт (2 кГц)
+    static constexpr double kTickUs = 500.0;                  // такт рабочего потока (опрос 0x54 - раз в physicalPollUs())
+    // Опрос 0x54 по умолчанию (ревизия 3, 2026-11-17): не чаще раза в 2 мс и не чаще интервала геймпада. Было 500 мкс
+    // (2000 запросов/с) - на V4.126 это 5 отказов USB3 из 5, на 4133 1 отказ за ~15 мин (HANDOFF_GAMEPAD_COM.md, 9и).
+    static constexpr double kDefaultPollUs = 2000.0;
+    static constexpr double kMaxAutoPollUs = 32000.0;           // потолок авто-опроса (снимок свежий 50 мс)
+    static constexpr double kRateWindowUs = 500000.0;          // окно замера частоты отчётов геймпада
+    // Поток физики (setPhysicalSource(Stream)): 0x54 нужен только ради sequence / cadence / частоты и признака "живой".
+    static constexpr double kStreamPollUs = 250000.0;
+    static constexpr double kStreamCheckUs = 1000000.0;        // как часто спрашивать 0x73 / 0x74, не выключился ли поток
     static constexpr double kVerifyUs = 250000.0;              // сверка GET 0x40
     static constexpr double kReleaseVerifyUs = 5000.0;         // сверка после отпускания и после починки
     static constexpr double kReplyTimeoutUs = 20000.0;         // нет ответа столько - запрос потерян
@@ -264,6 +282,17 @@ public:
         double tickLateMaxUs = 0.0;  // наибольшее опоздание такта рабочего потока
         bool injecting = false;      // перехват правого стика сейчас активен
         int16_t sentRx = 0, sentRy = 0;
+        double padCadenceUs = 0.0;   // интервал отчётов, объявленный геймпадом (cadence из 0x54); 0 - ещё не известен
+        double padReportRate = 0.0;  // измеренная частота отчётов геймпада, в с (по sequence за ~0.5 с)
+        double commandPeriodUs = 0.0, physicalPollUs = 0.0;  // действующие периоды
+        // Поток физики 0x73 / 0x74 -> 0x75 (setPhysicalSource)
+        bool streamWanted = false;   // вызывающий просил поток
+        bool streamActive = false;   // плата подтвердила оба потока в двоичном режиме
+        bool streamUnsupported = false;  // плата ответила FF на запрос 0x73 / 0x74
+        uint64_t streamEvents = 0;   // событий 0x75 разобрано
+        uint64_t streamUnavailable = 0;  // событий с id 255 ("снимок недоступен")
+        uint64_t streamWrites = 0;   // сколько раз транспорт включал / выключал поток
+        uint64_t streamFailures = 0; // включение не подтвердилось (повтор через kStreamCheckUs)
     };
 
     GamepadRawTransport() { cmdEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr); }
@@ -315,6 +344,8 @@ public:
                 if (writeSmoothing(restoreInterp_, restoreBuffer_)) readSettings();
             }
             haveRestore_ = false;
+            // Поток физики, если транспорт его включал: выключить (mode 0), чтобы плата не слала события в закрытый порт.
+            if (streamTouched_ && connected_.load() && handle_ != INVALID_HANDLE_VALUE && !ioError_.load()) disableStream();
         }
         closeHandle();
         connected_ = false;
@@ -418,18 +449,58 @@ public:
 
     // Период команд цели, мкс. Не задан (или us <= 0) - по настройкам платы: 2000 при Auto / Fixed (родной цикл
     // интерполятора), 1000 при Off. Округляется до целого числа тактов по 500 мкс, меньше 1000 не ставится.
+    // Ревизия 3 (2026-11-17): и заданный, и по умолчанию - НЕ КОРОЧЕ интервала геймпада (padCadenceUs()). Клон на плате
+    // объявляет Windows тот же интервал опроса, что и настоящий геймпад (CONTROLLER_PHYSICAL.md: cadence - "configured
+    // report cadence"), поэтому чаще плата всё равно не отдаст, а лишние команды только грузят COM. Геймпад 125 / 250 /
+    // 500 Гц -> команда раз в 8 / 4 / 2 мс. Пока cadence не пришёл (первые мс после open()), действует период режима.
     void setCommandPeriodUs(double us) { periodUs_.store(us > 0.0 ? std::max(us, 1000.0) : 0.0, std::memory_order_release); }
     double commandPeriodUs() const {
         const double p = periodUs_.load(std::memory_order_acquire);
-        return p > 0.0 ? p : (boardOff_.load(std::memory_order_acquire) ? kOffCommandPeriodUs : kDefaultCommandPeriodUs);
+        const double mode = p > 0.0 ? p : (boardOff_.load(std::memory_order_acquire) ? kOffCommandPeriodUs : kDefaultCommandPeriodUs);
+        return std::max(mode, padCadenceUs_.load(std::memory_order_acquire));
     }
 
-    // Период опроса физического геймпада (GET 0x54), мкс: целое число тактов по 500 мкс, по умолчанию 500 (2000
-    // запросов/с). Геймпад шлёт отчёты раз в 1 мс, поэтому 1000 теряет только в свежести снимка (до 1 мс старше);
-    // реже 1000 - physical() пропускает отчёты. Добавлено 2026-11-15 для проверки "не слишком ли жёсткая нагрузка":
-    // см. pad_soak.cpp. Снимок считается свежим 50 мс (kLiveUs), ставить больше 10000 не имеет смысла.
-    void setPhysicalPollUs(double us) { pollUs_.store(std::clamp(us, kTickUs, 10000.0), std::memory_order_release); }
-    double physicalPollUs() const { return pollUs_.load(std::memory_order_acquire); }
+    // Период опроса физического геймпада (GET 0x54), мкс: целое число тактов по 500 мкс.
+    // Ревизия 3: по умолчанию (us <= 0) - max(2000, интервал геймпада), то есть 500 запросов/с на 1000-Гц геймпаде и
+    // 125 / 250 запросов/с на 125 / 250-Гц. Чаще интервала геймпада опрос не даёт новых отчётов, только свежесть снимка.
+    // Заданное значение (500..10000) берётся как есть - для проб нагрузки (pad_soak.cpp). Было до ревизии 3: 500.
+    void setPhysicalPollUs(double us) { pollUs_.store(us > 0.0 ? std::clamp(us, kTickUs, 10000.0) : 0.0, std::memory_order_release); }
+    double physicalPollUs() const {
+        const double p = pollUs_.load(std::memory_order_acquire);
+        if (p > 0.0) return p;
+        if (streamOn_.load(std::memory_order_acquire)) return kStreamPollUs;
+        return std::clamp(padCadenceUs_.load(std::memory_order_acquire), kDefaultPollUs, kMaxAutoPollUs);
+    }
+
+    // ---- источник физики: опрос 0x54 или поток 0x73 / 0x74 (ревизия 3, 2026-11-17, НА ПЛАТЕ НЕ ПРОВЕРЕНО) ------
+    // Poll (по умолчанию) - как раньше: GET 0x54 раз в physicalPollUs(), транспорт 0x73 / 0x74 не трогает вовсе.
+    // Stream - плата сама шлёт события 0x75 (kind 1 оси id 10-15, kind 2 кнопки; value u16 LE; только изменившиеся
+    // значения, проверка раз в periodMs 1..1000) и physical() обновляется по ним; GET 0x54 остаётся раз в 250 мс ради
+    // sequence, cadence, частоты и признака live. Включение: запрос с пустым телом (ответ mode u8 + period u16 LE), если
+    // не "2, periodMs" - SET [2, period], затем снова запрос и сверка. Плата ответила FF - поток не поддерживается
+    // (streamUnsupported), транспорт остаётся на опросе. По документации makcu.com потоки есть "с V4.105 (test build)",
+    // выключены после включения питания и после переподключения; поэтому транспорт спрашивает их состояние раз в 1 с и
+    // включает заново, а при появлении геймпада и после переподключения платы - сразу. close() выключает (mode 0).
+    // MAKCU 2026-11-17: поток "должен быть легче опроса", данных нет. Минусы: в событиях нет sequence и времени отчёта;
+    // во время редких синхронных обменов (настройки, включение потока) пришедшие события пропускаются - кнопки и оси
+    // догоняет ближайший снимок 0x54 (до 250 мс).
+    enum class PhysicalSource : uint8_t { Poll = 0, Stream = 1 };
+    void setPhysicalSource(PhysicalSource s, int streamPeriodMs = 1) {
+        streamPeriodMs_.store(static_cast<uint16_t>(std::clamp(streamPeriodMs, 1, 1000)), std::memory_order_release);
+        wantStream_.store(s == PhysicalSource::Stream, std::memory_order_release);
+        streamSeq_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    PhysicalSource physicalSource() const { return wantStream_.load(std::memory_order_acquire) ? PhysicalSource::Stream : PhysicalSource::Poll; }
+    bool streamActive() const { return streamOn_.load(std::memory_order_acquire); }
+
+    // Интервал отчётов, который объявил геймпад (cadence из 0x54, мкс; 0 - ещё не известен) - этот интервал плата
+    // объявляет Windows для клона. И измеренная частота отчётов (новых sequence в с за последние ~0.5 с; 0 - не
+    // измерена или геймпада нет). Если геймпад шлёт заметно реже объявленного (GameSir с открытым Connect: ~225 при
+    // cadence 1 мс), свободные слоты клона заполнит инжект - Windows увидит больше отчётов, чем шлёт геймпад
+    // (225 + 500 команд/с = ~722 пакета/с, HANDOFF_GAMEPAD_COM.md, 9к). Тогда вызывающий может сам поставить
+    // setCommandPeriodUs(1e6 / padReportRate()).
+    double padCadenceUs() const { return padCadenceUs_.load(std::memory_order_acquire); }
+    double padReportRate() const { return padRate_.load(std::memory_order_acquire); }
 
     // Плавный вход и выход, мс: вес цели w идёт 0 -> 1 за enterMs после первого setRightStick() и 1 -> 0 за exitMs
     // после releaseRightStick(); на плату уходит физика + (цель - физика) * smoothstep(w). 0 - без перехода (скачок,
@@ -489,7 +560,7 @@ public:
         PadPhysical p = phys_;
         const int64_t now = detail::Qpc::now();
         p.ageUs = physT_ ? detail::Qpc::toUs(now - physT_) : 0.0;
-        p.live = snapT_ != 0 && detail::Qpc::toUs(now - snapT_) < kLiveUs && connected();
+        p.live = snapT_ != 0 && detail::Qpc::toUs(now - snapT_) < liveWindowUs() && connected();
         p.controllerKind = kind_.load();
         return p;
     }
@@ -538,6 +609,17 @@ public:
         const uint64_t sent = sent_.load();
         s.sentRx = unpackX(sent);
         s.sentRy = unpackY(sent);
+        s.padCadenceUs = padCadenceUs();
+        s.padReportRate = padReportRate();
+        s.commandPeriodUs = commandPeriodUs();
+        s.physicalPollUs = physicalPollUs();
+        s.streamWanted = wantStream_.load();
+        s.streamActive = streamOn_.load();
+        s.streamUnsupported = streamUnsupported_.load();
+        s.streamEvents = streamEvents_.load();
+        s.streamUnavailable = streamUnavailable_.load();
+        s.streamWrites = streamWrites_.load();
+        s.streamFailures = streamFailures_.load();
         return s;
     }
     void resetStats() {
@@ -552,19 +634,30 @@ public:
         cmdIntMaxUs_ = 0.0;
         tickLateMaxUs_ = 0.0;
         for (auto& p : presses_) p = 0;
+        padRate_ = 0.0;
+        streamEvents_ = streamUnavailable_ = streamWrites_ = streamFailures_ = 0;
     }
     std::string statsLine() const {
         const Stats s = stats();
-        char b[512];
+        char b[640];
         std::snprintf(b, sizeof(b),
-            "связь %s, геймпад %s | 0x54: запросов %llu, новых отчётов %llu, отказов FF %llu, без ответа %llu, пропущено отчётов %llu | "
+            "связь %s, геймпад %s (интервал %.0f мкс, отчётов %.0f/с; периоды: команд %.0f, опроса %.0f мкс) | "
+            "0x54: запросов %llu, новых отчётов %llu, отказов FF %llu, без ответа %llu, пропущено отчётов %llu | "
             "стик: команд %llu (интервал %.0f/%.0f мкс), отпусканий %llu, команд кнопок %llu, отказов %llu, сверок %llu, починок %llu | "
             "такт опоздал до %.0f мкс | обрывов %llu, восстановлений %llu",
-            s.connected ? "есть" : "НЕТ", padKindName(s.controllerKind), u(s.polls), u(s.newSamples), u(s.rejects), u(s.lost), u(s.skipped),
+            s.connected ? "есть" : "НЕТ", padKindName(s.controllerKind), s.padCadenceUs, s.padReportRate, s.commandPeriodUs, s.physicalPollUs,
+            u(s.polls), u(s.newSamples), u(s.rejects), u(s.lost), u(s.skipped),
             u(s.stickCommands), s.cmdIntervalAvgUs, s.cmdIntervalMaxUs, u(s.releases), u(s.padCommands), u(s.stickRejects), u(s.verifies), u(s.repairs),
             s.tickLateMaxUs,
             u(s.linkLost), u(s.reconnects));
-        return b;
+        std::string line = b;
+        if (s.streamWanted || s.streamEvents) {
+            std::snprintf(b, sizeof(b), " | поток 0x73/0x74: %s, событий %llu, недоступно %llu, включений %llu, неудач %llu",
+                s.streamActive ? "вкл" : (s.streamUnsupported ? "НЕ ПОДДЕРЖИВАЕТСЯ (FF)" : "выкл"), u(s.streamEvents), u(s.streamUnavailable),
+                u(s.streamWrites), u(s.streamFailures));
+            line += b;
+        }
+        return line;
     }
     // Строка о подключении: порт, скорость, прошивка, геймпад, интерполяция, снят ли перехват.
     std::string info() const {
@@ -574,7 +667,7 @@ public:
 
 private:
     static constexpr uint8_t kOpDevice = 0x02, kOpFirmware = 0x04, kOpConnection = 0x3E, kOpCtlState = 0x40, kOpCtlPhysical = 0x54,
-                             kOpInputChange = 0x53;
+                             kOpInputChange = 0x53, kOpAxesStream = 0x73, kOpButtonsStream = 0x74, kOpStreamEvent = 0x75;
     static unsigned long long u(uint64_t v) { return static_cast<unsigned long long>(v); }
 
     // Слот цели: бит 32 - перехват активен, биты 0..15 rx, 16..31 ry.
@@ -931,6 +1024,8 @@ private:
         if (auto r = ask(kOpFirmware, nullptr, 0, 100000.0, 4)) firmware_ = le32(r->data());
         readSettings();
         enforceSmoothing();  // если вызывающий просил setSmoothing(): нет геймпада - применится, когда он появится
+        streamOn_ = false;   // после переподключения поток выключен (документация); включить заново, если просили
+        enforceStream();
         const bool clean = clearBoardState();
         sent_ = pack(false, 0, 0);
         injecting_ = false;
@@ -958,6 +1053,93 @@ private:
         }
     }
 
+    // Сколько снимок считается свежим: 50 мс, но не меньше 2.5 периодов опроса (при потоке опрос раз в 250 мс, а стик,
+    // который стоит, событий не шлёт - значение верно, пока геймпад на месте).
+    double liveWindowUs() const { return std::max(kLiveUs, 2.5 * physicalPollUs()); }
+
+    // ---- поток физики 0x73 / 0x74 -> 0x75 (только рабочий поток или open() / close()) ------------------------
+    // Привести поток к желаемому: wantStream_ - включить оба в двоичном режиме с периодом streamPeriodMs_, иначе -
+    // выключить, если транспорт его включал. Синхронный обмен: запрос (пустое тело) -> при расхождении SET [mode, period]
+    // -> запрос и сверка. true - состояние платы совпало с желаемым.
+    bool enforceStream() {
+        const bool want = wantStream_.load(std::memory_order_acquire);
+        if (!want) {
+            if (streamTouched_) disableStream();
+            return true;
+        }
+        if (streamUnsupported_.load()) return false;
+        const uint16_t period = streamPeriodMs_.load(std::memory_order_acquire);
+        for (const uint8_t op : {kOpAxesStream, kOpButtonsStream}) {
+            auto q = ask(op, nullptr, 0, 100000.0, 3);
+            if (q && q->size() == 1 && (*q)[0] == 0xFF) {  // команды нет в этой прошивке
+                streamUnsupported_ = true;
+                streamOn_ = false;
+                return false;
+            }
+            if (q && q->size() == 3 && (*q)[0] == 2 && le16(q->data() + 1) == period) continue;
+            const uint8_t pl[3] = {2, static_cast<uint8_t>(period), static_cast<uint8_t>(period >> 8)};
+            streamTouched_ = true;
+            if (!sendFrame(op, pl, sizeof(pl))) break;
+            streamWrites_.fetch_add(1, std::memory_order_relaxed);
+            auto v = ask(op, nullptr, 0, 100000.0, 3);
+            if (!v || v->size() != 3 || (*v)[0] != 2) {
+                streamFailures_.fetch_add(1, std::memory_order_relaxed);
+                streamOn_ = false;
+                return false;
+            }
+        }
+        streamOn_ = !ioError_.load();
+        return streamOn_.load();
+    }
+    void disableStream() {
+        const uint16_t period = streamPeriodMs_.load(std::memory_order_acquire);
+        for (const uint8_t op : {kOpAxesStream, kOpButtonsStream}) {
+            const uint8_t pl[3] = {0, static_cast<uint8_t>(period), static_cast<uint8_t>(period >> 8)};
+            if (sendFrame(op, pl, sizeof(pl))) streamWrites_.fetch_add(1, std::memory_order_relaxed);
+            (void)ask(op, nullptr, 0, 50000.0, 3);  // дождаться подтверждения (или тайм-аута), заодно вычитать события
+        }
+        streamOn_ = false;
+        streamTouched_ = false;
+    }
+    // Событие 0x75: kind (1 оси, 2 кнопки), id, value u16 LE. Обновляет снимок физики; фронты нажатий - как у 0x54.
+    void onStreamEvent(uint8_t kind, uint8_t id, uint16_t value, int64_t now) {
+        streamEvents_.fetch_add(1, std::memory_order_relaxed);
+        if (id == 255) {  // снимок недоступен (геймпада нет): тип устройства спросит шаг 5 рабочего цикла
+            streamUnavailable_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(physMutex_);
+        PadPhysical& p = phys_;
+        if (kind == 1) {
+            const auto s = static_cast<int16_t>(value);
+            switch (id) {
+            case 10:
+                if (value >= kPadTriggerDown && p.lt < kPadTriggerDown) presses_[10].fetch_add(1, std::memory_order_relaxed);
+                p.lt = value;
+                break;
+            case 11:
+                if (value >= kPadTriggerDown && p.rt < kPadTriggerDown) presses_[11].fetch_add(1, std::memory_order_relaxed);
+                p.rt = value;
+                break;
+            case 12: p.lx = s; break;
+            case 13: p.ly = s; break;
+            case 14: p.rx = s; break;
+            case 15: p.ry = s; break;
+            default: return;
+            }
+        } else if (kind == 2) {
+            if (id >= kPadControlCount) return;
+            uint32_t& word = id < 32 ? p.digitalLow : p.digitalHigh;
+            const uint32_t bit = 1u << (id < 32 ? id : id - 32);
+            if (value && !(word & bit)) presses_[id].fetch_add(1, std::memory_order_relaxed);
+            word = value ? (word | bit) : (word & ~bit);
+        } else {
+            return;
+        }
+        snapT_ = now;  // геймпад на месте
+        physT_ = now;
+    }
+
     void onSnapshot(const uint8_t* p, int64_t now) {
         PadPhysical v;
         v.digitalLow = le32(p);
@@ -975,6 +1157,8 @@ private:
         v.baselineRestarted = (timing & 0x4000) != 0;
         v.timingInvalid = (timing & 0x8000) != 0;
         v.cadenceUframes = le16(p + 30);
+        // Интервал, объявленный геймпадом: 1..512 микрокадров (0.125..64 мс); иначе - не трогать прежний.
+        if (v.cadenceUframes >= 1 && v.cadenceUframes <= 512) padCadenceUs_.store(v.cadenceUframes * 125.0, std::memory_order_release);
         std::lock_guard<std::mutex> lock(physMutex_);
         snapT_ = now;
         const bool first = phys_.samples == 0;
@@ -997,6 +1181,15 @@ private:
         phys_ = v;
         physT_ = now;
         newSamples_.fetch_add(1, std::memory_order_relaxed);
+        // Частота отчётов: прирост sequence за окно ~0.5 с (только рабочий поток, под physMutex_).
+        if (rateT0_ == 0 || v.sequence < rateSeq0_) {
+            rateT0_ = now;
+            rateSeq0_ = v.sequence;
+        } else if (const double w = detail::Qpc::toUs(now - rateT0_); w >= kRateWindowUs) {
+            padRate_.store(static_cast<double>(v.sequence - rateSeq0_) * 1e6 / w, std::memory_order_release);
+            rateT0_ = now;
+            rateSeq0_ = v.sequence;
+        }
     }
 
     // Состояние сверки GET 0x40 (только рабочий поток).
@@ -1048,7 +1241,17 @@ private:
             } else if (f.op == kOpDevice && f.pl.size() == 1) {
                 const uint8_t k = static_cast<uint8_t>(f.pl[0] & 0xFC);
                 if (k != 0 && kind_.load() == 0) kindAppeared = true;
+                if (k == 0) {  // геймпада нет: частота не измерена, окно - заново
+                    std::lock_guard<std::mutex> lock(physMutex_);
+                    padRate_.store(0.0, std::memory_order_release);
+                    rateT0_ = 0;
+                }
                 kind_ = k;
+            } else if (f.op == kOpStreamEvent && f.pl.size() == 4) {
+                onStreamEvent(f.pl[0], f.pl[1], le16(f.pl.data() + 2), now);
+            } else if ((f.op == kOpAxesStream || f.op == kOpButtonsStream) && f.pl.size() == 3) {
+                // ответ на проверку раз в 1 с: поток выключился (перезапуск USB3, чужая программа) - включить заново
+                if (wantStream_.load(std::memory_order_acquire) && (f.pl[0] != 2 || le16(f.pl.data() + 1) != streamPeriodMs_.load())) streamRecheck_ = true;
             }
             // 0x53 (события), 0x3E (уведомления о топологии) и прочее - не нужны
         }
@@ -1063,6 +1266,8 @@ private:
         uint64_t tickNo = 0, lastCmdTick = 0;
         uint64_t releaseSeen = releaseSeq_.load();
         uint64_t interpSeen = interpSeq_.load();
+        uint64_t streamSeen = streamSeq_.load();  // open() уже применил поток в connect()
+        int64_t nextStreamCheckT = 0;
         double blendW = 0.0;        // вес цели в плавном входе и выходе, 0..1
         int goalX = 0, goalY = -1;  // последняя заданная цель
         uint32_t sentBl = 0, sentBh = 0;  // кнопки и триггеры, которые сейчас заданы на плате
@@ -1119,7 +1324,16 @@ private:
             if (kindAppeared) {
                 readSettings();  // редкий синхронный обмен: геймпад только что появился
                 enforceSmoothing();
+                if (wantStream_.load(std::memory_order_acquire)) enforceStream();
                 updateInfo(true);
+                answered_.store(polls_.load());
+                due = detail::Qpc::now();
+            }
+            // Поток физики: просьба setPhysicalSource() или проверка увидела его выключенным - синхронно привести к желаемому.
+            if (const uint64_t seq = streamSeq_.load(std::memory_order_acquire); seq != streamSeen || streamRecheck_) {
+                streamSeen = seq;
+                streamRecheck_ = false;
+                enforceStream();
                 answered_.store(polls_.load());
                 due = detail::Qpc::now();
             }
@@ -1166,7 +1380,7 @@ private:
                     bool havePhys = false;
                     {
                         std::lock_guard<std::mutex> lock(physMutex_);
-                        havePhys = phys_.samples > 0 && snapT_ != 0 && detail::Qpc::toUs(now - snapT_) < kLiveUs;
+                        havePhys = phys_.samples > 0 && snapT_ != 0 && detail::Qpc::toUs(now - snapT_) < liveWindowUs();
                         px = phys_.rx;
                         py = phys_.ry;
                     }
@@ -1269,9 +1483,20 @@ private:
                 bool have = false;
                 {
                     std::lock_guard<std::mutex> lock(physMutex_);
-                    have = snapT_ != 0 && detail::Qpc::toUs(now - snapT_) < kLiveUs;
+                    have = snapT_ != 0 && detail::Qpc::toUs(now - snapT_) < liveWindowUs();
                 }
                 if (!have || kind_.load() == 0) sendFrame(kOpDevice);
+            }
+
+            // 5а. Поток физики: раз в 1 с спросить состояние 0x73 / 0x74 (ответ разберёт processIncoming); если включить
+            // не удалось - попробовать снова. Если плата сказала FF - больше не трогать.
+            if (wantStream_.load(std::memory_order_acquire) && !streamUnsupported_.load() && now >= nextStreamCheckT) {
+                nextStreamCheckT = now + detail::Qpc::fromUs(kStreamCheckUs);
+                if (!streamOn_.load()) streamRecheck_ = true;
+                else {
+                    sendFrame(kOpAxesStream);
+                    sendFrame(kOpButtonsStream);
+                }
             }
 
             // 6. Связь.
@@ -1312,7 +1537,11 @@ private:
     std::atomic<uint64_t> sent_{0};  // что сейчас задано на плате (pack)
     std::atomic<bool> injecting_{false};
     std::atomic<double> periodUs_{0.0};  // 0 - по настройкам платы (commandPeriodUs())
-    std::atomic<double> pollUs_{kTickUs};  // период GET 0x54 (setPhysicalPollUs)
+    std::atomic<double> pollUs_{0.0};  // период GET 0x54 (setPhysicalPollUs); 0 - по интервалу геймпада (physicalPollUs())
+    std::atomic<double> padCadenceUs_{0.0};  // cadence из 0x54, мкс
+    std::atomic<double> padRate_{0.0};       // измеренная частота отчётов геймпада, в с
+    int64_t rateT0_ = 0;                     // начало окна замера частоты (под physMutex_)
+    uint32_t rateSeq0_ = 0;
     std::atomic<uint64_t> releaseSeq_{0}, releaseDone_{0};
     std::atomic<double> blendEnterMs_{-1.0}, blendExitMs_{-1.0};  // < 0 - по настройкам платы
     std::atomic<bool> boardOff_{false};       // настройки прочитаны и интерполяция платы Off
@@ -1341,6 +1570,15 @@ private:
     std::atomic<uint64_t> polls_{0}, answered_{0}, snapshots_{0}, newSamples_{0}, rejects_{0}, lost_{0}, skipped_{0};
     std::atomic<uint64_t> stickCommands_{0}, releases_{0}, stickRejects_{0}, verifies_{0}, repairs_{0};
     std::atomic<uint64_t> linkLost_{0}, reconnects_{0};
+    // Поток физики (setPhysicalSource)
+    std::atomic<bool> wantStream_{false};
+    std::atomic<uint16_t> streamPeriodMs_{1};
+    std::atomic<uint64_t> streamSeq_{0};          // растёт при каждом setPhysicalSource(): рабочий поток применяет
+    std::atomic<bool> streamOn_{false};           // плата подтвердила оба потока
+    std::atomic<bool> streamUnsupported_{false};  // FF на запрос 0x73 / 0x74
+    bool streamTouched_ = false;                  // транспорт слал SET 0x73 / 0x74 (выключить в close())
+    bool streamRecheck_ = false;                  // проверка раз в 1 с увидела поток выключенным
+    std::atomic<uint64_t> streamEvents_{0}, streamUnavailable_{0}, streamWrites_{0}, streamFailures_{0};
     std::atomic<double> lastOutageMs_{0.0};
     std::atomic<uint64_t> cmdIntCount_{0};
     std::atomic<double> cmdIntSumUs_{0.0}, cmdIntMaxUs_{0.0}, tickLateMaxUs_{0.0};

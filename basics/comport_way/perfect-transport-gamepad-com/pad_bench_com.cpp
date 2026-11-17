@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
     bool keep = false;      // --keep: не возвращать прежнюю интерполяцию при выходе
     bool buttons = false;   // --buttons: раздел 5, инжект кнопок и триггеров
     bool holdOnly = false;  // --hold: раздел 5 без серии tap()
-    double pollUs = 0.0;    // --poll US: период опроса 0x54 (setPhysicalPollUs); 0 - по умолчанию 500
+    double pollUs = 0.0;    // --poll US: период опроса 0x54 (setPhysicalPollUs); 0 - по умолчанию транспорта (с ревизии 3: max(2000, интервал геймпада), до неё 500)
     int bufferMs = -1;      // --buffer MS: буфер сглаживания платы (setSmoothingBuffer), вместе с --set-smoothing
     bool mid2 = false;      // --mid2: рендерер "АЦП раз в команду, середину ставит плата" (опыт Fixed + буфер 2 мс)
     bool ramp = false;      // --ramp: раздел 6, пила стиком и приращения пакетов Windows (как плата делит шаг команды)

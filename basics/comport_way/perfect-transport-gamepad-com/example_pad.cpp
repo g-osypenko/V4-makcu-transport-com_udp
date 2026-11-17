@@ -7,10 +7,13 @@
 //                                                без рендерера. ГЕЙМПАД НЕ ТРОГАТЬ. Окна нет.
 //   --smoothing off|fixed|auto                   к любому режиму: поставить сглаживание платы кодом (setSmoothing,
 //                                                APPLY без SAVE). При выходе возвращается прежнее; --keep - оставить.
+//   --stream [MS]                                к любому режиму: физика потоком 0x73 / 0x74 (события 0x75, период MS,
+//                                                по умолчанию 1) вместо опроса 0x54 (setPhysicalSource). НА ПЛАТЕ НЕ
+//                                                ПРОВЕРЕНО; первый запуск - --check --stream, затем --buttons 20 --stream.
 //
 // Что показывает пример:
-//   1. цель задаётся раз в commandPeriodUs(): 2 мс при сглаживании платы Auto (чаще плата не берёт), 1 мс при Off;
-//      пресет рендерера под режим платы: presetFor() при Auto, presetOff() при Off;
+//   1. цель задаётся раз в commandPeriodUs(): 2 мс при сглаживании платы Auto (чаще плата не берёт), 1 мс при Off,
+//      и не чаще интервала геймпада (125 Гц -> 8 мс); пресет рендерера - presetForTransport() под режим и такт;
 //   2. ось Y платы направлена вниз: вверх = отрицательное ry;
 //   3. в конце ОБЯЗАТЕЛЬНО releaseRightStick(): без него стик остался бы зажатым.
 //
@@ -18,6 +21,7 @@
 #include "makcu_gamepad_raw_transport.h"
 #include "makcu_gamepad_renderer.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -54,10 +58,12 @@ int main(int argc, char** argv) {
     bool check = false, plain = false, keep = false;
     int smoothing = -1;  // --smoothing: 0 Off, 1 Fixed, 2 Auto; -1 - не трогать
     double buttonsSec = 0.0;
+    int streamMs = 0;  // --stream [MS]: физика потоком 0x73 / 0x74 вместо опроса 0x54 (0 - опрос)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const bool more = i + 1 < argc;
         if (a == "--port" && more) port = argv[++i];
+        else if (a == "--stream") streamMs = (more && std::isdigit(static_cast<unsigned char>(argv[i + 1][0]))) ? std::atoi(argv[++i]) : 1;
         else if (a == "--check") check = true;
         else if (a == "--plain") plain = true;
         else if (a == "--buttons" && more) buttonsSec = std::atof(argv[++i]);
@@ -67,11 +73,12 @@ int main(int argc, char** argv) {
         } else if (a == "--keep") keep = true;
         else smoothing = -2;
         if (smoothing == -2) {
-            std::printf("example_pad.exe [--port COM5] [--check | --buttons S | --plain] [--smoothing off|fixed|auto [--keep]]\n");
+            std::printf("example_pad.exe [--port COM5] [--check | --buttons S | --plain] [--smoothing off|fixed|auto [--keep]] [--stream [MS]]\n");
             return 2;
         }
     }
     makcu::GamepadRawTransport tx;
+    if (streamMs > 0) tx.setPhysicalSource(makcu::GamepadRawTransport::PhysicalSource::Stream, streamMs);
     if (smoothing >= 0) {
         tx.setSmoothing(static_cast<uint8_t>(smoothing));  // до open(): применится при открытии, если геймпад на месте
         tx.keepSmoothingOnClose(keep);
@@ -82,6 +89,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("[+] %s\n", tx.info().c_str());
+    if (streamMs > 0) {
+        const auto s = tx.stats();
+        std::printf("[%c] --stream %d мс: поток 0x73/0x74 %s (включений %llu, неудач %llu)\n", s.streamActive ? '+' : '-', streamMs,
+            s.streamActive ? "включён, физика идёт событиями 0x75, опрос 0x54 раз в 250 мс"
+                           : (s.streamUnsupported ? "НЕ ПОДДЕРЖИВАЕТСЯ прошивкой (FF), остаётся опрос" : "не включился, транспорт будет пробовать раз в 1 с"),
+            static_cast<unsigned long long>(s.streamWrites), static_cast<unsigned long long>(s.streamFailures));
+    }
     const makcu::PadSettings st = tx.settings();
     if (st.valid) {
         std::printf("    настройки платы: интерполяция %u (0 Off, 1 Fixed, 2 Auto), буфер %u мс, разброс времени %u %%, ревизия %u, записей настроек %llu\n",
@@ -136,11 +150,9 @@ int main(int argc, char** argv) {
     makcu::PadTextureRenderer renderer;
     const double periodUs = tx.commandPeriodUs();
     {
-        // Пресет под режим платы: при Off - модель АЦП геймпада на такте 1 мс, при Auto - каскады под интерполятор платы.
-        makcu::PadRendererProfile prof = tx.boardSmoothingOff() ? makcu::PadTextureRenderer::presetOff(tx.controllerKind())
-                                                                : makcu::PadTextureRenderer::presetFor(tx.controllerKind());
-        prof.tick_hz = static_cast<float>(1e6 / periodUs);  // такт рендерера = период команд
-        renderer.setProfile(prof);
+        // Пресет под режим платы и интервал геймпада: при Off - модель АЦП геймпада, при Auto - каскады под интерполятор
+        // платы; такт рендерера = период команд транспорта (не короче интервала геймпада).
+        renderer.setProfile(makcu::PadTextureRenderer::presetForTransport(tx.controllerKind(), tx.boardSmoothingOff(), periodUs, tx.padCadenceUs()));
     }
     renderer.beginEvent(0x1234ABCDull, start.rx, start.ry);
     const double kPi = 3.14159265358979323846;
