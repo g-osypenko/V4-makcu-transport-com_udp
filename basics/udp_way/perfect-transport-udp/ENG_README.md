@@ -15,11 +15,25 @@
 > the board, may send UDP to programs on the PC. Parameters narrow it:
 >
 > ```powershell
-> .\setup_firewall.bat -Check                         # show the state, change nothing, no rights needed
+> .\setup_firewall.bat -Check                         # show the state, change nothing (also asks UAC)
 > .\setup_firewall.bat -InterfaceAlias Ethernet       # the rule for this adapter only
 > .\setup_firewall.bat -RemoteAddress 192.168.50.175  # this address only, rerun when the IP changes
+> .\setup_firewall.bat -RemoteAddress Any             # any address, if the board is on another subnet
 > .\setup_firewall.bat -Remove                        # delete the rule
 > ```
+>
+> The script runs everything, `-Check` included, in an elevated window and prints its output in the original
+> one: on some systems `Get-NetFirewallRule` without rights sees no rules and returns an empty list, so the check
+> falsely said "no rule". A failure to read the rules is now reported as such, not as "no rule". The script also
+> looks for **enabled inbound UDP block rules**: a block beats an allow, and Windows creates one itself when you
+> press Cancel in the "Allow access?" dialog. A block for all programs makes the verdict "no working rule"; a block
+> for one program is printed as an `[i]` line. The owner debugged this version on a friend's laptop on 2026-11-17,
+> where it worked (no run details); it has not yet been run with admin rights on the rig PC.
+>
+> `firewall_diag.bat` (next to it) is a read-only diagnostic that changes nothing: firewall profiles, networks and
+> addresses, MAKCU rules, enabled inbound block rules, UDP listeners. It writes `firewall_diag.txt` next to itself.
+> Without admin rights it may not see the rules (see above), so run it "as administrator" for a true picture. The
+> file contains the PC's addresses and program list: do not publish someone else's.
 >
 > Instead of the rule you can mark the network as private (on our machine the Private firewall is off):
 > `Set-NetConnectionProfile -InterfaceAlias "Ethernet" -NetworkCategory Private`.
@@ -85,6 +99,7 @@ this limit does not trigger in practice.
 | `makcu_udp_discover.h` | finds the board on the network, separate from the transport (optional) |
 | `find_makcu.cpp` | lists the boards on the network: `find_makcu.exe [--port 8080]` |
 | `setup_firewall.bat`, `setup_firewall.ps1` | the firewall rule for button events |
+| `firewall_diag.bat`, `firewall_diag.ps1` | read-only firewall diagnostic, writes `firewall_diag.txt` |
 | `build_example.bat` | builds all three programs: MinGW-w64 g++, C++17+ |
 
 To use it: copy `makcu_udp_batch_transport.h` (and `makcu_udp_discover.h` if you want the search), link

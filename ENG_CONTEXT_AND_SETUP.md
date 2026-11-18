@@ -21,7 +21,8 @@ Entry point of the project. Current as of **2026-10-12**. Details are in the REA
 >
 > **Once:** run `basics/udp_way/perfect-transport-udp/setup_firewall.bat` (double click, UAC asks for rights).
 > It creates or replaces the rule "MAKCU UDP events": inbound UDP from the local subnet for any program, so
-> the board's IP is not needed. To check without rights: `.\setup_firewall.bat -Check` from that folder. The parameters and
+> the board's IP is not needed. To check: `.\setup_firewall.bat -Check` from that folder (also asks UAC: without rights
+> Windows may hide the rules). A read-only diagnostic: `firewall_diag.bat` in the same folder. The parameters and
 > the price of such a rule are at the top of the README in that folder.
 >
 > Instead of the rule you can mark the network as private (on our machine the Private firewall is off):

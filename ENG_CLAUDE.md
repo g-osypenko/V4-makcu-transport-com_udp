@@ -5,7 +5,7 @@
 Two single-header C++ transports for the **MAKCU** board: COM (`makcu_raw_transport.h`) and UDP (`makcu_udp_batch_transport.h`), same API.
 Bench: `basics/track_bench.h` with `track_test_com.cpp` and `track_test.cpp`.
 The UDP address differs per user (DHCP): `example_line`, `controls_test`, `track_test` default to `--host auto` (`makcu_udp_discover.h`, `find_makcu.exe`).
-Firewall rule for button events: `setup_firewall.bat`, not yet run with administrator rights on this PC.
+Firewall rule for button events: `setup_firewall.bat`. `setup_firewall.ps1` replaced 2026-11-17 by the version the owner debugged on a friend's laptop, where it worked (elevates even for `-Check`, reports read errors, checks block rules); `firewall_diag.bat` added (read-only). Not yet run with administrator rights on this PC.
 
 **Owner's rules:** report in Russian; warn before every live test what the hand must do; the test window text must match the chat, because the
 owner follows the window; cursor-moving tests only in their own clipped window; do not reverse the firmware and do not change it without the owner's decision
