@@ -24,7 +24,15 @@
 //   taps2-p100   100/с / 500/с    / круг + tap(RT) каждые 250 мс, стик не отпускается (кнопки со стиком)
 //   hold2-p100   100/с / нет      / удержание RT + A 3.2 с, пауза 0.5 с (кнопки без стика)
 //   apply2-p100  100/с / 500/с    / круг + запись настроек 0x1D BEGIN / WRITE / APPLY каждые 2 с (буфер 4 <-> 8, Off)
-// Ступени идут в порядке таблицы kSteps; --steps только выбирает, какие из них выполнять.
+// Без --steps ступени идут в порядке таблицы kSteps (с --from - начиная с указанной); с --steps - в заданном порядке.
+//
+// Свободные ступени (2026-11-20, поиск безопасного темпа на 4133 с упором на опрос): имя p<N> - опрос 0x54 N раз в с
+// без инжекта, p<N>-c<M> - опрос N/с + круг стиком M команд/с (опрос 100..2000/с, команд до 1000/с).
+// Пример: --steps p500-c250,p1000-c250,p2000-c250.
+//
+// --keep-going S (2026-11-20): на 4133 геймпад после отказа сам встаёт за ~1.2-2 с. С ключом лестница на отказе не
+// останавливается: ждёт до S с новых отчётов, считает отказ и время восстановления и идёт дальше (нагрузка всё это
+// время продолжается). Не вернулся за S с - стоп, код 3. Код 2 - отказы были, но все восстановились.
 //
 // ГЕЙМПАД НЕ ТРОГАТЬ. Окна нет: рядом запускать pad_probes\pad_probe_view.exe --rate 0 --notouch --dur S.
 // Steam закрыть (раскладка рабочего стола превращает A в Enter). Код выхода: 0 - все ступени пройдены, 3 - обрыв.
@@ -134,6 +142,53 @@ const Step kSteps[] = {
     {"all2-p500", 2000, 2000, 5, "опрос 500/с, 500 команд/с: круг 2 с + tap, отпускание, удержание RT + A 1.5 с"},
 };
 
+struct RunStep {
+    std::string name;
+    double pollUs = 0, cmdUs = 0;
+    int pattern = 0;
+    std::string what;
+    double onMs = 0, offMs = 0;  // pattern 7: эпизоды инжекта
+};
+
+// p<N>, p<N>-c<M> или p<N>-c<M>-e<ON>-<OFF>: опрос N/с, круг стиком M команд/с; с -e - эпизодами: ON мс инжект (круг),
+// затем releaseRightStick() и OFF мс отпущено (как доводка прицела в игре). 2026-11-20.
+bool parseFree(const std::string& name, RunStep& out) {
+    int poll = 0, cmd = 0, on = 0, off = 0, used = 0;
+    if (std::sscanf(name.c_str(), "p%d-c%d-e%d-%d%n", &poll, &cmd, &on, &off, &used) == 4 && used == static_cast<int>(name.size())) {
+        if (on < 50 || off < 50 || cmd <= 0) return false;
+    } else if (std::sscanf(name.c_str(), "p%d-c%d%n", &poll, &cmd, &used) == 2 && used == static_cast<int>(name.size())) {
+    } else if (std::sscanf(name.c_str(), "p%d%n", &poll, &used) == 1 && used == static_cast<int>(name.size())) {
+        cmd = 0;
+    } else {
+        return false;
+    }
+    if (poll < 100 || poll > 2000 || cmd < 0 || cmd > 1000 || (cmd > 0 && cmd < 10)) return false;
+    out.name = name;
+    out.pollUs = 1e6 / poll;
+    out.cmdUs = cmd > 0 ? 1e6 / cmd : 0.0;
+    out.pattern = on > 0 ? 7 : cmd > 0 ? 1 : 0;
+    out.onMs = on;
+    out.offMs = off;
+    char b[128];
+    if (on > 0) std::snprintf(b, sizeof(b), "опрос %d/с, эпизоды: %d мс круг %d команд/с, %d мс отпущено", poll, on, cmd, off);
+    else if (cmd > 0) std::snprintf(b, sizeof(b), "опрос %d/с, круг стиком %d команд/с", poll, cmd);
+    else std::snprintf(b, sizeof(b), "опрос %d/с, без инжекта", poll);
+    out.what = b;
+    return true;
+}
+
+// Состояние для окна pad_probe_view (2026-11-20): %TEMP%\makcu_pad_status.txt = OK / ABSENT / STALL. Во время инжекта
+// Windows видит клон платы с инжектом, и зависание настоящего геймпада окну иначе не видно.
+void writeSoakStatus(const char* s) {
+    char dir[MAX_PATH] = {};
+    if (!GetTempPathA(MAX_PATH, dir)) return;
+    const std::string path = std::string(dir) + "makcu_pad_status.txt";
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+        std::fputs(s, f);
+        std::fclose(f);
+    }
+}
+
 std::string nowText() {
     SYSTEMTIME t;
     GetLocalTime(&t);
@@ -148,19 +203,55 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::string port = "COM5", only, from;
-    double stepSec = 120.0;
+    double stepSec = 120.0, keepGoing = 0.0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--port" && i + 1 < argc) port = argv[++i];
         else if (a == "--step" && i + 1 < argc) stepSec = std::atof(argv[++i]);
-        else if (a == "--steps" && i + 1 < argc) only = std::string(",") + argv[++i] + ",";
+        else if (a == "--steps" && i + 1 < argc) only = argv[++i];
         else if (a == "--from" && i + 1 < argc) from = argv[++i];
+        else if (a == "--keep-going" && i + 1 < argc) keepGoing = std::atof(argv[++i]);
         else if (a == "--list") {
             for (const Step& s : kSteps) std::printf("%-11s %s\n", s.name, s.what);
+            std::printf("p<N>[-c<M>] свободная ступень: опрос N/с (100..2000), круг стиком M команд/с (до 1000)\n");
             return 0;
         } else {
-            std::printf("pad_soak.exe [--port COM5] [--step S] [--steps a,b,c] [--from NAME] [--list]\n");
+            std::printf("pad_soak.exe [--port COM5] [--step S] [--steps a,b,c] [--from NAME] [--keep-going S] [--list]\n");
             return 1;
+        }
+    }
+    // Список ступеней: --steps в заданном порядке (имена таблицы или p<N>[-c<M>]), иначе вся таблица (с --from).
+    std::vector<RunStep> plan;
+    auto fromTable = [](const Step& s) { return RunStep{s.name, s.pollUs, s.cmdUs, s.pattern, s.what}; };
+    if (!only.empty()) {
+        size_t pos = 0;
+        while (pos <= only.size()) {
+            const size_t comma = only.find(',', pos);
+            const std::string name = only.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            pos = comma == std::string::npos ? only.size() + 1 : comma + 1;
+            if (name.empty()) continue;
+            RunStep rs;
+            bool ok = false;
+            for (const Step& s : kSteps) {
+                if (name == s.name) {
+                    rs = fromTable(s);
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) ok = parseFree(name, rs);
+            if (!ok) {
+                std::printf("[-] неизвестная ступень %s (--list)\n", name.c_str());
+                return 1;
+            }
+            plan.push_back(rs);
+        }
+    } else {
+        bool started = from.empty();
+        for (const Step& s : kSteps) {
+            if (!started && from != s.name) continue;
+            started = true;
+            plan.push_back(fromTable(s));
         }
     }
 
@@ -171,25 +262,38 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("[+] %s %s\n", nowText().c_str(), tx.info().c_str());
-    if (tx.controllerKind() == 0) {
-        std::printf("[-] плата не видит геймпад на USB3\n");
-        return 1;
+    if (tx.controllerKind() == 0) {  // 2026-11-20: по радио геймпад мог уснуть до старта - ждём до 60 с, пока его разбудят
+        std::printf("[i] плата не видит геймпад на USB3 - жду до 60 с (разбуди геймпад: качни левый стик)\n");
+        const int64_t until = Q::now() + Q::fromUs(60e6);
+        while (tx.controllerKind() == 0 && Q::now() < until) Sleep(100);
+        if (tx.controllerKind() == 0) {
+            std::printf("[-] плата не видит геймпад на USB3\n");
+            return 1;
+        }
+        Sleep(1000);
+        std::printf("[+] %s геймпад появился: %s\n", nowText().c_str(), tx.info().c_str());
     }
     std::thread xi(xinputLoop);
     Sleep(500);
-    std::printf("[i] ступень %.0f с; ГЕЙМПАД НЕ ТРОГАТЬ\n", stepSec);
+    std::printf("[i] ступень %.0f с; правый стик, RT и A НЕ ТРОГАТЬ%s\n", stepSec,
+        keepGoing > 0 ? "; на отказе лестница не останавливается (--keep-going)" : "");
     std::printf("время    | ступень     |   с | Windows пакетов/с | плата: запросов/с, новых отчётов/с, FF, без ответа, пропущено | команд стика/с, кнопок, отказов 0x40, починок\n");
 
-    bool dropped = false, started = from.empty();
-    const char* droppedAt = "";
+    bool dropped = false;
+    std::string droppedAt;
     double droppedSec = 0;
-    for (const Step& st : kSteps) {
-        if (!started) {
-            if (from != st.name) continue;
-            started = true;
-        }
-        if (!only.empty() && only.find(std::string(",") + st.name + ",") == std::string::npos) continue;
-        std::printf("== %s %s: %s ==\n", nowText().c_str(), st.name, st.what);
+    int totalDrops = 0;
+    struct StepResult {
+        std::string name;
+        double sec;
+        int drops;
+        double downMax;
+    };
+    std::vector<StepResult> results;
+    for (const RunStep& st : plan) {
+        std::printf("== %s %s: %s ==\n", nowText().c_str(), st.name.c_str(), st.what.c_str());
+        int stepDrops = 0;
+        double downMax = 0.0, downSince = -1.0;
         tx.setPhysicalPollUs(st.pollUs);
         tx.setCommandPeriodUs(st.cmdUs > 0 ? st.cmdUs : 1000.0);
         Sleep(300);
@@ -197,7 +301,7 @@ int main(int argc, char** argv) {
         const int64_t t0 = Q::now();
         uint64_t xiPrev = g_xiPackets.load();
         auto prev = tx.stats();
-        double nextReport = 10.0, lastAlive = 0.0;
+        double nextReport = 10.0, lastAlive = 0.0, nextStatus = 0.0;
         uint64_t aliveSamples = prev.newSamples;
         uint64_t c0 = tx.commandCount();
         int phase = -1, taps = 0, applyAsked = 0, applyFailed = 0;
@@ -206,9 +310,13 @@ int main(int argc, char** argv) {
         bool stickOn = false;
         for (;;) {
             const double t = Q::toUs(Q::now() - t0) / 1e6;
-            if (t >= stepSec) break;
+            if (t >= stepSec && downSince < 0) break;  // в отказе ступень дожидается возврата (или --keep-going)
             // --- нагрузка ---
-            const double cmdT = static_cast<double>(tx.commandCount() - c0) * tx.commandPeriodUs() / 1e6;  // время по командам стика
+            // Время по командам стика. СЧИТАТЬ ПОСЛЕ waitCommand() (2026-11-20): раньше cmdT брался в начале итерации, до
+            // ожидания, и после пробуждения цель ставилась по старому счётчику - равной только что отправленной. Пока
+            // транспорт слал команду каждый период, это давало дубль каждого значения (новых положений вдвое меньше
+            // темпа); с повтором неизменной команды раз в 250 мс (ревизия 4) темп команд упал вдвое (200 -> 100/с).
+            auto cmdTime = [&] { return static_cast<double>(tx.commandCount() - c0) * tx.commandPeriodUs() / 1e6; };
             auto circle = [&](double tt) {
                 const double r = 12000.0 * std::min(1.0, tt / 0.25);
                 tx.setRightStick(static_cast<int16_t>(std::lround(r * std::cos(6.2831853 * tt))), static_cast<int16_t>(std::lround(r * std::sin(6.2831853 * tt))));
@@ -217,6 +325,25 @@ int main(int argc, char** argv) {
             case 0:
                 Sleep(5);
                 break;
+            case 7: {  // эпизоды: 0 - круг onMs, 1 - отпущено offMs
+                const double pt = t - phaseT0;
+                if (phase < 0 || (phase == 1 && pt * 1000.0 >= st.offMs)) {
+                    phase = 0;
+                    phaseT0 = t;
+                    c0 = tx.commandCount();
+                    circle(0.0);
+                } else if (phase == 0 && pt * 1000.0 >= st.onMs) {
+                    phase = 1;
+                    phaseT0 = t;
+                    tx.releaseRightStick();
+                } else if (phase == 0) {
+                    tx.waitCommand(50);
+                    circle(cmdTime());
+                    break;
+                }
+                Sleep(1);
+                break;
+            }
             case 1:
             case 2:
             case 6:
@@ -226,7 +353,7 @@ int main(int argc, char** argv) {
                     circle(0.0);
                 }
                 tx.waitCommand(50);
-                circle(cmdT);
+                circle(cmdTime());
                 if (st.pattern == 2 && t >= 0.25 * (taps + 1)) {
                     tx.tap(Id::RightTrigger, 80);
                     ++taps;
@@ -282,7 +409,7 @@ int main(int argc, char** argv) {
                         tx.releaseRightStick();
                     } else {
                         tx.waitCommand(50);
-                        circle(cmdT);
+                        circle(cmdTime());
                         if (pt >= 0.25 * (taps + 1)) {
                             tx.tap(Id::RightTrigger, 80);
                             ++taps;
@@ -310,17 +437,40 @@ int main(int argc, char** argv) {
                 aliveSamples = s.newSamples;
                 lastAlive = t;
             }
-            if (t - lastAlive > 1.5 || tx.controllerKind() == 0) {
+            if (t >= nextStatus) {
+                nextStatus = t + 0.25;
+                writeSoakStatus(tx.padStalled() ? "STALL" : tx.padAbsent() ? "ABSENT" : "OK");
+            }
+            const bool silent = t - lastAlive > 1.5 || tx.controllerKind() == 0;
+            if (silent && downSince < 0) {
+                std::printf("[!] %s ОБРЫВ на ступени %s: последний новый отчёт геймпада на %.1f с ступени; kinds %02X, Windows XInput: %s; транспорт: %s\n", nowText().c_str(),
+                    st.name.c_str(), lastAlive, tx.controllerKind(), g_xiOk.load() ? "есть" : "нет",
+                    tx.padAbsent() ? "плата сказала - геймпада нет (отказ платы)" : tx.padStalled() ? "геймпад ЗАВИС (снимки идут, sequence стоит)" : "ни отказа, ни зависания ещё не видит");
+                ++stepDrops;
+                ++totalDrops;
+                if (keepGoing <= 0) {
+                    dropped = true;
+                    droppedAt = st.name;
+                    droppedSec = lastAlive;
+                    break;
+                }
+                downSince = lastAlive;
+            } else if (!silent && downSince >= 0) {
+                const double down = t - downSince;
+                downMax = std::max(downMax, down);
+                std::printf("[+] %s геймпад вернулся на %.1f с ступени: молчал %.1f с (отсчёт от последнего отчёта); kinds %02X, Windows XInput: %s\n", nowText().c_str(), t, down,
+                    tx.controllerKind(), g_xiOk.load() ? "есть" : "нет");
+                downSince = -1.0;
+            } else if (silent && t - downSince > keepGoing) {
                 dropped = true;
                 droppedAt = st.name;
-                droppedSec = lastAlive;
-                std::printf("[!] %s ОБРЫВ на ступени %s: последний новый отчёт геймпада на %.1f с ступени; kinds %02X, Windows XInput: %s\n", nowText().c_str(), st.name, lastAlive,
-                    tx.controllerKind(), g_xiOk.load() ? "есть" : "нет");
+                droppedSec = downSince;
+                std::printf("[!] %s геймпад НЕ ВЕРНУЛСЯ за %.0f с (молчит с %.1f с ступени) - лестница остановлена\n", nowText().c_str(), keepGoing, downSince);
                 break;
             }
             if (t >= nextReport) {
                 const uint64_t xiNow = g_xiPackets.load();
-                std::printf("%s | %-11s | %3.0f | %17.0f | %6.0f %6.0f %4llu %4llu %4llu | %5.0f %4llu %4llu %4llu\n", nowText().c_str(), st.name, t, (xiNow - xiPrev) / 10.0,
+                std::printf("%s | %-11s | %3.0f | %17.0f | %6.0f %6.0f %4llu %4llu %4llu | %5.0f %4llu %4llu %4llu\n", nowText().c_str(), st.name.c_str(), t, (xiNow - xiPrev) / 10.0,
                     (s.polls - prev.polls) / 10.0, (s.newSamples - prev.newSamples) / 10.0, static_cast<unsigned long long>(s.rejects - prev.rejects),
                     static_cast<unsigned long long>(s.lost - prev.lost), static_cast<unsigned long long>(s.skipped - prev.skipped), (s.stickCommands - prev.stickCommands) / 10.0,
                     static_cast<unsigned long long>(s.padCommands - prev.padCommands), static_cast<unsigned long long>(s.stickRejects - prev.stickRejects),
@@ -330,9 +480,12 @@ int main(int argc, char** argv) {
                 nextReport += 10.0;
             }
         }
+        const double stepT = Q::toUs(Q::now() - t0) / 1e6;
         tx.releaseButtons();
         tx.releaseRightStick(200);
-        std::printf("   итог %s: %s\n", st.name, tx.statsLine().c_str());
+        std::printf("   итог %s: %s\n", st.name.c_str(), tx.statsLine().c_str());
+        std::printf("   отказов на ступени %s: %d за %.0f с, дольше всего молчал %.1f с\n", st.name.c_str(), stepDrops, stepT, downMax);
+        results.push_back({st.name, stepT, stepDrops, downMax});
         if (st.pattern == 6) {
             const uint64_t writes = tx.stats().settingsWrites - writes0;
             std::printf("   записи настроек: запрошено %d, записано (BEGIN / WRITE / APPLY) %llu, не подтверждено %d\n", applyAsked, static_cast<unsigned long long>(writes), applyFailed);
@@ -343,10 +496,13 @@ int main(int argc, char** argv) {
         }
         if (dropped) break;
     }
-    if (dropped) std::printf("[!] ИТОГ: геймпад пропал на ступени %s (%.1f с ступени). Дальше лестница не идёт.\n", droppedAt, droppedSec);
+    std::printf("== сводка: ступень | с | отказов | дольше всего молчал, с ==\n");
+    for (const StepResult& r : results) std::printf("   %-14s | %4.0f | %3d | %.1f\n", r.name.c_str(), r.sec, r.drops, r.downMax);
+    if (dropped) std::printf("[!] ИТОГ: геймпад пропал на ступени %s (%.1f с ступени) и не вернулся. Дальше лестница не идёт.\n", droppedAt.c_str(), droppedSec);
+    else if (totalDrops > 0) std::printf("[~] ИТОГ %s: все ступени пройдены, отказов %d, все восстановились\n", nowText().c_str(), totalDrops);
     else std::printf("[+] ИТОГ %s: все ступени пройдены, геймпад на месте\n", nowText().c_str());
     g_stop = true;
     xi.join();
     tx.close();
-    return dropped ? 3 : 0;
+    return dropped ? 3 : totalDrops > 0 ? 2 : 0;
 }

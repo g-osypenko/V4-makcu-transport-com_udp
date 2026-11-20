@@ -94,6 +94,27 @@ void boardLoop(Port* p, double rate) {
     }
 }
 
+// Состояние, которое пишет pad_soak (2026-11-20): 0 - нет свежего файла, 1 - OK / ABSENT, 2 - STALL (геймпад завис).
+int g_lastSoakState = 0;
+int readSoakStatus() {
+    char dir[MAX_PATH] = {};
+    if (!GetTempPathA(MAX_PATH, dir)) return 0;
+    const std::string path = std::string(dir) + "makcu_pad_status.txt";
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a)) return 0;
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    const auto toU = [](const FILETIME& f) { return (static_cast<unsigned long long>(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+    if (toU(nowFt) - toU(a.ftLastWriteTime) > 30000000ull) return 0;  // старше 3 с
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return 0;
+    char b[16] = {};
+    const size_t n = std::fread(b, 1, sizeof(b) - 1, f);
+    std::fclose(f);
+    if (n >= 5 && std::strncmp(b, "STALL", 5) == 0) return 2;
+    return 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -102,10 +123,18 @@ int main(int argc, char** argv) {
     double dur = 600.0, rate = 0.0;
     bool noTouch = false;  // рядом идёт программа, которая инжектит стик (example_pad, pad_bench_com): надпись "НЕ ТРОГАЙ"
     // --keepalive: то же, но геймпад по радио может уснуть без касаний (инжект он не чувствует), поэтому владелец раз в
-    // 20 с качает ЛЕВЫЙ стик (ступени pad_soak его не используют). 2026-11-16.
+    // 10 с качает ЛЕВЫЙ стик (ступени pad_soak его не используют). 2026-11-16; 2026-11-20 было «раз в 20 с» - геймпад
+    // уснул на 48-й с (на плате донгл без геймпада, PID_2106), стало 10 с.
     bool keepAlive = false;
     bool press = false;    // --press: проверка кнопок рукой (рядом example_pad --buttons): надпись "Нажимай ЗАДНИЕ кнопки..."
     bool watch = false;    // --watch: рядом pad_drop_watch.ps1 ловит отказ и опрашивает плату по COM ~40 с после него
+    // --offon OFF ON (2026-11-20, проверка живучести транспорта ревизии 4): сценарий по времени от старта окна - до OFF с
+    // "не трогай, через N с ВЫКЛЮЧИ геймпад", с OFF до ON "ВЫКЛЮЧИ геймпад СЕЙЧАС", с ON "ВКЛЮЧИ геймпад СЕЙЧАС", после
+    // возврата "Геймпад включён. Больше не трогай". Надпись сценария главнее надписей об отказе (пропажа здесь ожидаема).
+    double offAt = -1.0, onAt = -1.0;
+    // --pollonly (2026-11-20): рядом pad_soak только опрашивает 0x54, инжекта нет - "Инжекта нет. Правый стик не трогай,
+    // раз в 10 с качни ЛЕВЫЙ стик". Отказы показываются как при --notouch ("жди сообщения в чате").
+    bool pollOnly = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const bool more = i + 1 < argc;
@@ -117,8 +146,13 @@ int main(int argc, char** argv) {
         else if (a == "--keepalive") noTouch = keepAlive = true;
         else if (a == "--press") press = true;
         else if (a == "--watch") watch = true;
-        else {
-            std::printf("pad_probe_view.exe [--port COM5] [--rate 0|N] [--dur 600] [--log FILE] [--notouch | --keepalive | --press | --watch]\n");
+        else if (a == "--pollonly") noTouch = pollOnly = true;
+        else if (a == "--offon" && i + 2 < argc) {
+            offAt = std::atof(argv[++i]);
+            onAt = std::atof(argv[++i]);
+            noTouch = true;
+        } else {
+            std::printf("pad_probe_view.exe [--port COM5] [--rate 0|N] [--dur 600] [--log FILE] [--notouch | --keepalive | --press | --watch | --offon OFF ON]\n");
             return 2;
         }
     }
@@ -159,7 +193,7 @@ int main(int argc, char** argv) {
         const std::string s = clockStr();
         return std::wstring(s.begin(), s.end());  // только цифры и двоеточия
     };
-    std::wstring lastEvent = L"нет", lostAt, silentAt;
+    std::wstring lastEvent = L"нет", lostAt, silentAt, stallAt;
     int64_t lostT = t0, silentT = t0;  // когда пропал / замолчал (для отсчёта --watch)
     // "Молчит": Windows считает геймпад подключённым, но номер пакета XInput не растёт дольше 2 с. У GameSir номер
     // растёт ~1000 раз/с и в покое, поэтому тишина = геймпад завис (так было 2026-11-14 22:13 при инжекте с Off:
@@ -235,7 +269,30 @@ int main(int argc, char** argv) {
             // --watch: после отказа 40 с "НИЧЕГО НЕ ТРОГАЙ" с отсчётом (pad_drop_watch.ps1 в это время делает три снимка платы:
             // сразу, через 10 и через 30 с, каждый ~2.5 с), потом "плата опрошена, жди сообщения в чате".
             const bool badNow = (xiOk == 1 && silent) || (xiOk != 1 && everXi);
-            if (watch && badNow) {
+            // Состояние от pad_soak (2026-11-20): во время инжекта Windows видит клон платы с инжектом, и зависание
+            // настоящего геймпада окну не видно. pad_soak пишет %TEMP%\makcu_pad_status.txt (OK / ABSENT / STALL) раз в
+            // ~250 мс; файл старше 3 с не считается.
+            const int soakState = readSoakStatus();
+            if (soakState != g_lastSoakState) {
+                if (soakState == 2) out("[!] %s (%.1f с) pad_soak: геймпад ЗАВИС (плата отдаёт снимки, отчётов геймпада нет)\n", clockStr().c_str(), sec);
+                else if (g_lastSoakState == 2) out("[+] %s (%.1f с) pad_soak: зависание прошло\n", clockStr().c_str(), sec);
+                if (soakState == 2) {
+                    stallAt = wclock();
+                    lastEvent = L"ЗАВИС в " + stallAt;
+                }
+                g_lastSoakState = soakState;
+            }
+            if (soakState == 2 && offAt < 0.0) {
+                swprintf(hint[which], 160, L"ГЕЙМПАД ЗАВИС в %ls: плата видит его, но отчётов нет. Ничего не трогай: жди сообщения в чате", stallAt.c_str());
+            } else if (offAt >= 0.0) {
+                color = RGB(200, 90, 0);
+                if (sec < offAt) swprintf(hint[which], 160, L"НЕ трогай геймпад. Через %d с ВЫКЛЮЧИ геймпад", static_cast<int>(offAt - sec) + 1);
+                else if (sec < onAt) swprintf(hint[which], 160, L"ВЫКЛЮЧИ геймпад СЕЙЧАС и держи выключенным. Включить через %d с", static_cast<int>(onAt - sec) + 1);
+                else if (xiOk == 1 && !silent && upSince && toMs(upSince - t0) / 1000.0 >= onAt) {
+                    swprintf(hint[which], 160, L"Геймпад включён. Больше не трогай, жди конца");
+                    color = RGB(0, 130, 0);
+                } else swprintf(hint[which], 160, L"ВКЛЮЧИ геймпад СЕЙЧАС. Потом не трогай");
+            } else if (watch && badNow) {
                 const bool sil = xiOk == 1 && silent;
                 const int left = 40 - static_cast<int>(toMs(t - (sil ? silentT : lostT)) / 1000.0);
                 if (left > 0)
@@ -251,7 +308,8 @@ int main(int argc, char** argv) {
                 const int up = static_cast<int>(toMs(t - upSince) / 1000.0);
                 if (watch) swprintf(hint[which], 160, L"Крути ПРАВЫЙ стик кругами без перерыва. Донгл и провода НЕ трогай. На месте %d:%02d, обрывов: %d", up / 60, up % 60, drops);
                 else if (press) swprintf(hint[which], 160, L"Нажимай ЗАДНИЕ кнопки геймпада по очереди, каждую по 3 раза. Потом A и правый триггер");
-                else if (keepAlive) swprintf(hint[which], 160, L"Правый стик, RT и A НЕ трогай: их двигает программа. Раз в 20 с качни ЛЕВЫЙ стик. На месте %d:%02d, обрывов: %d", up / 60, up % 60, drops);
+                else if (pollOnly) swprintf(hint[which], 160, L"Инжекта нет, программа только читает. Правый стик не трогай, раз в 10 с качни ЛЕВЫЙ стик. На месте %d:%02d, обрывов: %d", up / 60, up % 60, drops);
+                else if (keepAlive) swprintf(hint[which], 160, L"Правый стик, RT и A НЕ трогай: их двигает программа. Раз в 10 с качни ЛЕВЫЙ стик. На месте %d:%02d, обрывов: %d", up / 60, up % 60, drops);
                 else if (noTouch) swprintf(hint[which], 160, L"НЕ ТРОГАЙ геймпад: стик и кнопки двигает программа. На месте %d:%02d, обрывов: %d", up / 60, up % 60, drops);
                 else swprintf(hint[which], 160, L"Геймпад на месте %d:%02d. Обрывов: %d. Стики можно крутить", up / 60, up % 60, drops);
                 color = noTouch ? RGB(200, 90, 0) : RGB(0, 130, 0);

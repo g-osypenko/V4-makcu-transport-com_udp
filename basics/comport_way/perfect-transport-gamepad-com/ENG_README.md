@@ -1,6 +1,15 @@
 # perfect-transport-gamepad-com (short English copy of README.md)
 
-State 2026-11-17. Transport revision 3, renderer revision 4. MAKCU firmware 4133 (custom dev build; before it official 4126).
+State 2026-11-20. Transport revision 4, renderer revision 4. MAKCU firmware 4133 (custom dev build; before it official 4126).
+
+Revision 4 (2026-11-20, built, not yet run on the board): on 4133 there is no safe COM rate (500 polls + 250 commands/s
+either passes 300 s or drops at 37 s and storms; HANDOFF §9m), so the transport focuses on survival. Gamepad absent
+(DEVICE kinds 0 or 3 FF replies to 0x54 in a row): SET 0x40 and verification paused, 0x54 polled every 50 ms; after a new
+sequence, 250 ms of silence, then injection resumes by itself (`padAbsent()`, `commandsSuspended()`). Storm (3 drops in
+60 s): polling capped at 100/s for 60 s after the last drop (`stormActive()`). Gamepad frozen (snapshots arrive, sequence
+stuck > 300 ms; GameSir needs a power cycle): `padStalled()`, injection continues. Defaults: commands every 4 ms (250/s)
+in every smoothing mode (was 2 ms Auto / 1 ms Off), 0x54 every 4 ms (250/s; the stick is absolute, 250/s is enough). Under injection the board gets only ~500
+reports/s from the gamepad, so polling faster than 500/s gives no new values.
 One test controller: GameSir in XInput mode (`kinds 0x82`), cable and later its 2.4 GHz receiver in the board's controller port.
 The Russian README.md is authoritative; full history in `HANDOFF_GAMEPAD_COM.md` (repo root).
 

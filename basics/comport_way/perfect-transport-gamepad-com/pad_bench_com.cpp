@@ -749,5 +749,6 @@ int main(int argc, char** argv) {
     std::printf("[%c] стик отпущен, GET 0x40 подтверждён: %s\n", released ? '+' : '-', released ? "да" : "НЕТ");
     std::printf("    %s\n", tx.statsLine().c_str());
     tx.close();
+    if (tx.smoothingRestoreFailed()) std::printf("[!] сглаживание платы НЕ возвращено (геймпада не было 4 с): на плате осталось заданное\n");
     return 0;
 }

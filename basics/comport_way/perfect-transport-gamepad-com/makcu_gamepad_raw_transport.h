@@ -1,7 +1,25 @@
-// MAKCU: транспорт геймпада по COM (USB2, CH343, 4 Мбод) - эталон, ревизия 3 (2026-11-17).
+// MAKCU: транспорт геймпада по COM (USB2, CH343, 4 Мбод) - эталон, ревизия 4 (2026-11-20).
 //
 // Один заголовок, C++20, без зависимостей кроме WinAPI (SetupAPI для поиска порта).
 // Проверено на плате V4.122 с геймпадом GameSir в режиме XInput (kinds 0x82), interpolation = auto, буфер 8 мс.
+//
+// РЕВИЗИЯ 4: ЖИВУЧЕСТЬ ПРИ ОТКАЗАХ ПЛАТЫ И ГЕЙМПАДА (HANDOFF_GAMEPAD_COM.md, 9м). На 4133 безопасного темпа нет:
+// геймпад пропадает с платы (kinds 00, 0x54 -> FF) и сам встаёт за ~2 с, после первого отказа идёт буря. До ревизии 4
+// транспорт всё это время бил плату на полном темпе (опрос до 2000/с, SET 0x40, починки сверки) - вероятный катализатор
+// бури. Теперь:
+//   - отказ (DEVICE -> kinds 0 или 3 ответа FF на 0x54 подряд): команды SET 0x40 приостановлены, опрос 0x54 раз в 50 мс,
+//     сверка не идёт; после возврата (новый sequence) ещё 250 мс тишины, затем инжект продолжается сам (при Off - снова
+//     с плавным входом). padAbsent(), commandsSuspended();
+//   - буря (3 отказа за 60 с): 60 с после последнего отказа опрос не чаще 100/с. stormActive();
+//   - зависание геймпада (снимки 0x54 приходят, sequence стоит > 300 мс; GameSir 2026-11-20 так висел до перезапуска
+//     самого геймпада): padStalled() - сообщить пользователю; инжект продолжается (плата отдаёт его Windows и так);
+//   - по совету MAKCU (2026-11-20 14:57): команды не чаще 200/с (раз в 5 мс) при любом режиме сглаживания (было 2 мс при
+//     Auto / Fixed, 1 мс при Off; утром 20.11 - 4 мс); неизменная команда повторяется раз в 250 мс, а не каждый период;
+//     удержание кнопок без стика - тоже раз в 250 мс (было 100); отпускание - один пакет нулей (повтор только если
+//     сверка GET 0x40 разошлась);
+//     опрос по умолчанию - 250/с (раз в 4 мс; в ревизии 3 было 2 мс). Под инжектом плата получает от геймпада ~500
+//     отчётов/с, поэтому чаще 500/с опрос новых значений не даёт, а стику (абсолютная величина) хватает 250/с.
+//     Заданные вызывающим периоды берутся как есть.
 //
 // РЕВИЗИЯ 3: ГЕЙМПАДЫ 125 / 250 / 500 / 1000 ГЦ (HANDOFF_GAMEPAD_COM.md, 9к). Клон на плате объявляет Windows тот же
 // интервал опроса, что и настоящий геймпад (cadence в 0x54), поэтому:
@@ -53,10 +71,11 @@
 // Темп команд (замер 2026-11-14, README): плата при interpolation = auto берёт цель раз в 2 мс.
 //   раз в 2 мс: выход линейно следует за командами (R2 0.96-0.99), отставание ~6.5 мс;
 //   раз в 1 мс: две трети команд пропадают, рисунок с периодом 3 отчёта, R2 0.60.
-// Поэтому транспорт сам шлёт SET 0x40 раз в 2 мс (setCommandPeriodUs), каждый раз самое свежее значение
+// Поэтому транспорт сам шлёт SET 0x40 раз в 2 мс (до ревизии 4; с ревизии 4 по умолчанию раз в 4 мс - см. выше;
+// setCommandPeriodUs), каждый раз самое свежее значение
 // (latest-wins, без суммирования). Вызывающему достаточно обновлять цель раз в 2 мс: commandPeriodUs().
-// Пока перехват активен, команда повторяется каждый период, даже если цель не менялась: так интерполятор
-// платы остаётся в одном режиме.
+// До ревизии 4 команда повторялась каждый период, даже если цель не менялась; с ревизии 4 неизменная команда - раз в
+// 250 мс (MAKCU: плата держит состояние сама). Влияние на интерполятор при неизменной цели не перемерялось.
 // Побочный эффект платы: пока идут команды, физический геймпад читается ~500 раз/с вместо 1000 (dt 1 и 3 мс).
 //
 // Ввод-вывод: один рабочий поток, синхронный порт, такт 500 мкс. В начале такта читается всё, что пришло
@@ -237,15 +256,27 @@ struct PadSettings {
 
 class GamepadRawTransport {
 public:
-    static constexpr double kDefaultCommandPeriodUs = 2000.0;  // родной цикл интерполятора платы при Auto (замер)
-    static constexpr double kOffCommandPeriodUs = 1000.0;      // при сглаживании Off плата берёт каждую команду раз в 1 мс
+    // Ревизия 4 (2026-11-20): 200 команд/с при любом режиме - совет MAKCU (ответ 2026-11-20 14:57, проверен их ведущим
+    // по прошивке): «состояние контроллера слать равномерно, не чаще ~200/с (не ближе 5 мс), без пачек; 1000/с не
+    // отзывчивее, плата только копит очередь». Сначала было 250/с. До ревизии 4: 2000 при Auto / Fixed, 1000 при Off - на
+    // 4126 / 4133 это отказы геймпада (HANDOFF_GAMEPAD_COM.md, 9и-9м). Чаще - только setCommandPeriodUs().
+    static constexpr double kDefaultCommandPeriodUs = 5000.0;
+    static constexpr double kOffCommandPeriodUs = 5000.0;
+    // MAKCU 2026-11-20: «держать одно состояние долго - повтор раз в 250-500 мс достаточно; keepalive плата держит сама».
+    // Поэтому неизменная команда (стик, кнопки, триггеры те же) повторяется не каждый период, а раз в 250 мс.
+    static constexpr double kHoldResendUs = 250000.0;
     static constexpr double kOffBlendEnterMs = 16.0;           // плавный вход при Off (при Auto плата сглаживает сама ~12 мс)
     static constexpr double kOffBlendExitMs = 24.0;            // плавный выход при Off
-    static constexpr double kPadKeepaliveUs = 100000.0;        // повтор удерживаемых кнопок и триггеров, пока стик не перехвачен
+    // Повтор удерживаемых кнопок и триггеров, пока стик не перехвачен: 250 мс (MAKCU 2026-11-20: 250-500 мс достаточно;
+    // сторож молчания платы 1 с). Было 100 мс.
+    static constexpr double kPadKeepaliveUs = 250000.0;
     static constexpr double kTickUs = 500.0;                  // такт рабочего потока (опрос 0x54 - раз в physicalPollUs())
-    // Опрос 0x54 по умолчанию (ревизия 3, 2026-11-17): не чаще раза в 2 мс и не чаще интервала геймпада. Было 500 мкс
-    // (2000 запросов/с) - на V4.126 это 5 отказов USB3 из 5, на 4133 1 отказ за ~15 мин (HANDOFF_GAMEPAD_COM.md, 9и).
-    static constexpr double kDefaultPollUs = 2000.0;
+    // Опрос 0x54 по умолчанию: не чаще раза в 4 мс (250/с; ревизия 4, решение владельца 2026-11-20) и не чаще интервала
+    // геймпада. Стик - абсолютная величина: снимок сразу даёт всё положение, пропуск теряет только форму движения между
+    // снимками; физика нужна для плавного входа / выхода, смешивания с рукой и признака "жив" - 250/с хватает (снимок не
+    // старше 4 мс). Под инжектом плата и так получает от геймпада ~500 отчётов/с. Для записи текстуры руки -
+    // setPhysicalPollUs(). Было: 2000 мкс (ревизия 3), 500 мкс до неё (2000/с: V4.126 5 отказов USB3 из 5).
+    static constexpr double kDefaultPollUs = 4000.0;
     static constexpr double kMaxAutoPollUs = 32000.0;           // потолок авто-опроса (снимок свежий 50 мс)
     static constexpr double kRateWindowUs = 500000.0;          // окно замера частоты отчётов геймпада
     // Поток физики (setPhysicalSource(Stream)): 0x54 нужен только ради sequence / cadence / частоты и признака "живой".
@@ -258,6 +289,15 @@ public:
     static constexpr double kReconnectRetryUs = 250000.0;
     static constexpr double kKindsPollUs = 500000.0;           // геймпада нет: как часто спрашивать DEVICE
     static constexpr double kLiveUs = 50000.0;                 // снимок старше - геймпад не "live"
+    // Ревизия 4: живучесть (HANDOFF_GAMEPAD_COM.md, 9м).
+    static constexpr int kAbsentFfRun = 3;                     // столько FF на 0x54 подряд - геймпада нет
+    static constexpr double kAbsentPollUs = 50000.0;           // опрос 0x54, пока геймпада нет
+    static constexpr double kResumeSettleUs = 250000.0;        // тишина после возврата геймпада до первой команды
+    static constexpr double kStallUs = 300000.0;               // снимки идут, sequence стоит столько - геймпад завис
+    static constexpr int kStormDrops = 3;                      // столько отказов за kStormWindowUs - буря
+    static constexpr double kStormWindowUs = 60e6;
+    static constexpr double kCalmUs = 60e6;                    // после последнего отказа в буре столько опрос ограничен
+    static constexpr double kCalmPollUs = 10000.0;             //   не чаще 100/с
 
     struct Stats {
         bool connected = false;
@@ -293,6 +333,14 @@ public:
         uint64_t streamUnavailable = 0;  // событий с id 255 ("снимок недоступен")
         uint64_t streamWrites = 0;   // сколько раз транспорт включал / выключал поток
         uint64_t streamFailures = 0; // включение не подтвердилось (повтор через kStreamCheckUs)
+        // Ревизия 4: живучесть
+        bool padAbsent = false;      // плата сообщила, что геймпада нет (kinds 0 / FF подряд)
+        bool padStalled = false;     // снимки идут, sequence стоит > 300 мс (геймпад завис)
+        bool commandsSuspended = false;  // SET 0x40 сейчас не шлются (геймпада нет или пауза после возврата)
+        bool storm = false;          // буря: опрос ограничен 100/с
+        uint64_t padDrops = 0, padStalls = 0, storms = 0;
+        uint64_t heldSkips = 0;      // тактов, на которых неизменная команда не повторялась (повтор раз в 250 мс)
+        double lastPadDownMs = 0.0;  // сколько длился последний отказ (до возврата sequence)
     };
 
     GamepadRawTransport() { cmdEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr); }
@@ -340,8 +388,16 @@ public:
             worker_.join();
             // Рабочий поток остановлен: порт теперь у этого потока. Если связь потеряна, вернуть нечем: на плате
             // останется заданное значение до её перезагрузки (APPLY в NOR не пишет).
+            // Без геймпада плата отдаёт в INFO "разделы 00" и раздела "контроллер" для записи нет (снимки во время
+            // отказов, pad_probes/data/drop_dongle2_info_t10.txt). 2026-11-19 (4133) геймпад отвалился перед close(), и
+            // плата осталась в Fixed / 2 мс. Поэтому ждать до 4 с: 4133 сама возвращает геймпад за ~1.5 с.
+            restoreFailed_ = false;
             if (haveRestore_ && !keepSmoothing_.load() && connected_.load() && handle_ != INVALID_HANDLE_VALUE && !ioError_.load()) {
-                if (writeSmoothing(restoreInterp_, restoreBuffer_)) readSettings();
+                bool ok = false;
+                const int64_t until = detail::Qpc::now() + detail::Qpc::fromUs(4e6);
+                while (!(ok = writeSmoothing(restoreInterp_, restoreBuffer_)) && !ioError_.load() && detail::Qpc::now() < until) Sleep(200);
+                if (ok) readSettings();
+                restoreFailed_ = !ok;
             }
             haveRestore_ = false;
             // Поток физики, если транспорт его включал: выключить (mode 0), чтобы плата не слала события в закрытый порт.
@@ -447,8 +503,8 @@ public:
         return id == MakcuControlId::LeftTrigger ? lt_.load(std::memory_order_acquire) : id == MakcuControlId::RightTrigger ? rt_.load(std::memory_order_acquire) : 0;
     }
 
-    // Период команд цели, мкс. Не задан (или us <= 0) - по настройкам платы: 2000 при Auto / Fixed (родной цикл
-    // интерполятора), 1000 при Off. Округляется до целого числа тактов по 500 мкс, меньше 1000 не ставится.
+    // Период команд цели, мкс. Не задан (или us <= 0) - 5000 (ревизия 4, совет MAKCU, при любом режиме; до неё 2000 при Auto / Fixed
+    // и 1000 при Off). Округляется до целого числа тактов по 500 мкс, меньше 1000 не ставится.
     // Ревизия 3 (2026-11-17): и заданный, и по умолчанию - НЕ КОРОЧЕ интервала геймпада (padCadenceUs()). Клон на плате
     // объявляет Windows тот же интервал опроса, что и настоящий геймпад (CONTROLLER_PHYSICAL.md: cadence - "configured
     // report cadence"), поэтому чаще плата всё равно не отдаст, а лишние команды только грузят COM. Геймпад 125 / 250 /
@@ -461,8 +517,8 @@ public:
     }
 
     // Период опроса физического геймпада (GET 0x54), мкс: целое число тактов по 500 мкс.
-    // Ревизия 3: по умолчанию (us <= 0) - max(2000, интервал геймпада), то есть 500 запросов/с на 1000-Гц геймпаде и
-    // 125 / 250 запросов/с на 125 / 250-Гц. Чаще интервала геймпада опрос не даёт новых отчётов, только свежесть снимка.
+    // По умолчанию (us <= 0) - max(4000, интервал геймпада) (ревизия 4; в ревизии 3 max(2000, ...)), то есть 250
+    // запросов/с на 1000-, 500- и 250-Гц геймпаде и 125/с на 125-Гц. Чаще интервала геймпада опрос не даёт новых отчётов, только свежесть снимка.
     // Заданное значение (500..10000) берётся как есть - для проб нагрузки (pad_soak.cpp). Было до ревизии 3: 500.
     void setPhysicalPollUs(double us) { pollUs_.store(us > 0.0 ? std::clamp(us, kTickUs, 10000.0) : 0.0, std::memory_order_release); }
     double physicalPollUs() const {
@@ -502,6 +558,21 @@ public:
     double padCadenceUs() const { return padCadenceUs_.load(std::memory_order_acquire); }
     double padReportRate() const { return padRate_.load(std::memory_order_acquire); }
 
+    // ---- живучесть (ревизия 4) ---------------------------------------------------------------------------
+    // Геймпада нет по словам платы (DEVICE -> kinds 0 или 3 FF на 0x54 подряд): отказ 4133 (встаёт сам за ~2 с) или
+    // геймпад вынут / уснул. Пока true, SET 0x40 не шлются, опрос раз в 50 мс; setRightStick() можно звать как обычно -
+    // после возврата и 250 мс тишины инжект продолжится сам.
+    bool padAbsent() const { return padAbsent_.load(std::memory_order_acquire); }
+    // Команды сейчас не шлются: геймпада нет или пауза после возврата.
+    bool commandsSuspended() const { return suspended_.load(std::memory_order_acquire); }
+    // Геймпад завис: плата отдаёт снимки 0x54, но sequence не растёт > 300 мс (у GameSir так бывает до перезапуска самого
+    // геймпада; HANDOFF_GAMEPAD_COM.md, 9м). Инжект продолжается - плата отдаёт его Windows и так, но рука не доходит.
+    // Вызывающему - сказать пользователю «перезапусти геймпад». НЕ ПРОВЕРЕНО на геймпадах, которые шлют отчёты только при
+    // изменениях (у GameSir отчёты идут всегда, 1000/с и без касаний).
+    bool padStalled() const { return padStalled_.load(std::memory_order_acquire); }
+    // Буря: 3 отказа за 60 с - опрос не чаще 100/с ещё 60 с после последнего отказа.
+    bool stormActive() const { return storm_.load(std::memory_order_acquire); }
+
     // Плавный вход и выход, мс: вес цели w идёт 0 -> 1 за enterMs после первого setRightStick() и 1 -> 0 за exitMs
     // после releaseRightStick(); на плату уходит физика + (цель - физика) * smoothstep(w). 0 - без перехода (скачок,
     // как отдаёт плата). Отрицательное - по настройкам платы: при Off 16 и 24 мс, при Auto / Fixed 0 (плата
@@ -540,14 +611,19 @@ public:
         return false;
     }
     void keepSmoothingOnClose(bool keep) { keepSmoothing_.store(keep, std::memory_order_release); }
+    // После close(): true - сглаживание меняли, но вернуть прежнее не удалось (геймпад не вернулся за 4 с, связь
+    // потеряна). На плате осталось заданное значение до перезагрузки платы, Toolkit или следующего setSmoothing().
+    bool smoothingRestoreFailed() const { return restoreFailed_; }
     // Буфер сглаживания платы, мс (1..64; u32 по смещению 8 образа настроек): пишется той же записью, что и
     // интерполяция, тоже без SAVE, и тоже возвращается в close(). Звать ДО setSmoothing() или open(): само по себе
     // ничего не шлёт, значение уйдёт со следующим применением сглаживания. ms < 0 - буфер не трогать (по умолчанию).
     // Добавлено 2026-11-15 для опыта "Fixed + буфер 2 мс" (HANDOFF_GAMEPAD_COM.md, 9з); смысл буфера не документирован.
     void setSmoothingBuffer(int ms) { wantBuffer_.store(ms < 0 ? -1 : std::clamp(ms, 1, 64), std::memory_order_release); }
     bool boardSmoothingOff() const { return boardOff_.load(std::memory_order_acquire); }
-    // Сколько команд цели ушло.
-    uint64_t commandCount() const { return stickCommands_.load(std::memory_order_acquire); }
+    // Сколько тактов команд цели прошло: отправленные команды плюс такты, на которых неизменную команду не повторяли
+    // (ревизия 4). По нему вызывающие считают время (commandCount() * commandPeriodUs()): если бы считались только
+    // отправки, при неподвижной цели часы вызывающего вставали бы до повтора раз в 250 мс. Отправки - Stats::stickCommands.
+    uint64_t commandCount() const { return cmdSlots_.load(std::memory_order_acquire); }
     // Дождаться отправки очередной команды цели (до timeoutMs). Так вызывающий шагает рендерер ровно раз на команду:
     //   tx.setRightStick(x0, y0);  for (;;) { tx.waitCommand(); renderer.step(...); tx.setRightStick(x, y); }
     // Значение, заданное сразу после waitCommand(), уйдёт следующей командой. false - тайм-аут (связи нет или
@@ -620,6 +696,15 @@ public:
         s.streamUnavailable = streamUnavailable_.load();
         s.streamWrites = streamWrites_.load();
         s.streamFailures = streamFailures_.load();
+        s.padAbsent = padAbsent();
+        s.padStalled = padStalled();
+        s.commandsSuspended = commandsSuspended();
+        s.storm = stormActive();
+        s.padDrops = padDrops_.load();
+        s.padStalls = padStalls_.load();
+        s.storms = storms_.load();
+        s.heldSkips = heldSkips_.load();
+        s.lastPadDownMs = lastPadDownMs_.load();
         return s;
     }
     void resetStats() {
@@ -636,6 +721,8 @@ public:
         for (auto& p : presses_) p = 0;
         padRate_ = 0.0;
         streamEvents_ = streamUnavailable_ = streamWrites_ = streamFailures_ = 0;
+        padDrops_ = padStalls_ = storms_ = heldSkips_ = 0;
+        lastPadDownMs_ = 0.0;
     }
     std::string statsLine() const {
         const Stats s = stats();
@@ -651,6 +738,9 @@ public:
             s.tickLateMaxUs,
             u(s.linkLost), u(s.reconnects));
         std::string line = b;
+        std::snprintf(b, sizeof(b), " | без повтора неизменной команды %llu | отказов геймпада %llu (последний %.1f с), зависаний %llu, бурь %llu%s%s%s", u(s.heldSkips),
+            u(s.padDrops), s.lastPadDownMs / 1000.0, u(s.padStalls), u(s.storms), s.padAbsent ? ", СЕЙЧАС НЕТ ГЕЙМПАДА" : "", s.padStalled ? ", СЕЙЧАС ЗАВИС" : "", s.storm ? ", буря: опрос <= 100/с" : "");
+        line += b;
         if (s.streamWanted || s.streamEvents) {
             std::snprintf(b, sizeof(b), " | поток 0x73/0x74: %s, событий %llu, недоступно %llu, включений %llu, неудач %llu",
                 s.streamActive ? "вкл" : (s.streamUnsupported ? "НЕ ПОДДЕРЖИВАЕТСЯ (FF)" : "выкл"), u(s.streamEvents), u(s.streamUnavailable),
@@ -1029,6 +1119,13 @@ private:
         const bool clean = clearBoardState();
         sent_ = pack(false, 0, 0);
         injecting_ = false;
+        // Ревизия 4: геймпада нет при подключении - команды ждут его появления (это не отказ, не считается).
+        padAbsent_ = kind_.load() == 0;
+        padStalled_ = false;
+        ffRun_ = 0;
+        lastNewT_ = 0;
+        resumeT_ = 0;
+        absentT_ = 0;
         updateInfo(clean);
         return true;
     }
@@ -1216,6 +1313,47 @@ private:
         }
     }
 
+    // ---- живучесть (ревизия 4; только рабочий поток) ----------------------------------------------------------
+    // Плата сказала, что геймпада нет (kinds 0 или FF подряд). Повторные сигналы того же отказа не считаются.
+    void onPadGone(int64_t now) {
+        if (padAbsent_.load(std::memory_order_relaxed)) return;
+        padAbsent_.store(true, std::memory_order_release);
+        padStalled_.store(false, std::memory_order_release);
+        absentT_ = now;
+        padDrops_.fetch_add(1, std::memory_order_relaxed);
+        // Буря: kStormDrops отказов за kStormWindowUs - опрос ограничен до kCalmUs после последнего отказа.
+        dropTimes_[dropIdx_++ % dropTimes_.size()] = now;
+        int recent = 0;
+        for (const int64_t t : dropTimes_) {
+            if (t && detail::Qpc::toUs(now - t) <= kStormWindowUs) ++recent;
+        }
+        if (recent >= kStormDrops) {
+            if (!storm_.load(std::memory_order_relaxed)) storms_.fetch_add(1, std::memory_order_relaxed);
+            storm_.store(true, std::memory_order_release);
+            calmUntilT_ = now + detail::Qpc::fromUs(kCalmUs);
+        }
+    }
+    // Пришёл новый sequence: геймпад жив. После отказа - ещё kResumeSettleUs тишины до команд.
+    void onPadAlive(int64_t now) {
+        lastNewT_ = now;
+        padStalled_.store(false, std::memory_order_release);
+        if (padAbsent_.load(std::memory_order_relaxed)) {
+            padAbsent_.store(false, std::memory_order_release);
+            if (absentT_) lastPadDownMs_.store(detail::Qpc::toUs(now - absentT_) / 1000.0, std::memory_order_relaxed);
+            resumeT_ = now + detail::Qpc::fromUs(kResumeSettleUs);
+        }
+    }
+    // Действующий период опроса 0x54 с учётом отказа и бури.
+    double effectivePollUs(int64_t now) {
+        double p = physicalPollUs();
+        if (padAbsent_.load(std::memory_order_relaxed)) return std::max(p, kAbsentPollUs);
+        if (storm_.load(std::memory_order_relaxed)) {
+            if (now < calmUntilT_) p = std::max(p, kCalmPollUs);
+            else storm_.store(false, std::memory_order_release);
+        }
+        return p;
+    }
+
     // Разобрать всё пришедшее. Конвейер: запросы уходят в конце такта, ответы читаются в начале следующего,
     // поэтому поток никогда не ждёт порт.
     void processIncoming(Verify& verify, bool& kindAppeared) {
@@ -1227,10 +1365,14 @@ private:
                 answered_.fetch_add(1, std::memory_order_relaxed);
                 if (f.pl.size() == 32) {
                     snapshots_.fetch_add(1, std::memory_order_relaxed);
+                    const uint64_t before = newSamples_.load(std::memory_order_relaxed);
                     onSnapshot(f.pl.data(), now);
+                    ffRun_ = 0;
+                    if (newSamples_.load(std::memory_order_relaxed) != before) onPadAlive(now);
                 } else {
                     // Отказ FF: геймпада нет, маршрут меняется или снимок занят. Прежний снимок НЕ затирается.
                     rejects_.fetch_add(1, std::memory_order_relaxed);
+                    if (++ffRun_ >= kAbsentFfRun) onPadGone(now);
                 }
             } else if (f.op == kOpCtlState) {
                 if (f.pl.size() == 20) onStateReply(f.pl.data(), verify, now);
@@ -1242,9 +1384,12 @@ private:
                 const uint8_t k = static_cast<uint8_t>(f.pl[0] & 0xFC);
                 if (k != 0 && kind_.load() == 0) kindAppeared = true;
                 if (k == 0) {  // геймпада нет: частота не измерена, окно - заново
-                    std::lock_guard<std::mutex> lock(physMutex_);
-                    padRate_.store(0.0, std::memory_order_release);
-                    rateT0_ = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(physMutex_);
+                        padRate_.store(0.0, std::memory_order_release);
+                        rateT0_ = 0;
+                    }
+                    onPadGone(now);
                 }
                 kind_ = k;
             } else if (f.op == kOpStreamEvent && f.pl.size() == 4) {
@@ -1273,6 +1418,7 @@ private:
         uint32_t sentBl = 0, sentBh = 0;  // кнопки и триггеры, которые сейчас заданы на плате
         uint16_t sentLt = 0, sentRt = 0;
         uint64_t lastSendTick = 0;        // такт последней отправки SET 0x40 (любой)
+        int64_t lastSendT = 0;            // время последней отправки SET 0x40 (для повтора неизменной команды)
         Verify verify;
         const int64_t tickQ = detail::Qpc::fromUs(kTickUs);
         while (!stop_.load(std::memory_order_acquire)) {
@@ -1350,6 +1496,31 @@ private:
             now = detail::Qpc::now();
             ++tickNo;
 
+            // 1а. Живучесть (ревизия 4). Зависание: снимки свежие, а sequence стоит дольше kStallUs.
+            if (!padAbsent_.load(std::memory_order_relaxed) && lastNewT_ && !padStalled_.load(std::memory_order_relaxed)) {
+                bool fresh = false;
+                {
+                    std::lock_guard<std::mutex> lock(physMutex_);
+                    fresh = snapT_ != 0 && detail::Qpc::toUs(now - snapT_) < liveWindowUs();
+                }
+                if (fresh && detail::Qpc::toUs(now - lastNewT_) > std::max(kStallUs, 3.0 * effectivePollUs(now))) {
+                    padStalled_.store(true, std::memory_order_release);
+                    padStalls_.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            // Геймпада нет или пауза после возврата: SET 0x40 и сверка не идут. При возврате плавный вход начнётся заново
+            // (при Off - с физики; при Auto / Fixed blendW сразу 1). Если цель отпустили, пока геймпада не было, а перехват
+            // на плате ещё числится (sent_), отпускание уйдёт после паузы обычным путём.
+            const bool suspended = padAbsent_.load(std::memory_order_relaxed) || now < resumeT_;
+            suspended_.store(suspended, std::memory_order_release);
+            if (suspended) {
+                blendW = 0.0;
+                lastCmdT = 0;
+                verify.pending = false;
+                verify.nextT = now + detail::Qpc::fromUs(kReleaseVerifyUs);
+                injecting_ = false;
+            }
+
             // 2. Цель правого стика: самое свежее значение, каждый N-й такт (сетка тактов, а не время прошлой
             // отправки: иначе дрожание такта превращало интервал 2 мс в 3 мс).
             //
@@ -1410,11 +1581,22 @@ private:
             // Отпускание стика: обе координаты 0, кнопки и триггеры - как заданы. При Auto плата сама доводит выход до
             // физического положения; при Off это скачок, поэтому к этому моменту плавный выход уже привёл команду к физике.
             if (releaseNow) sendNow = true;
-            if (sendNow) {
+            // Неизменная команда (MAKCU 2026-11-20): стик, кнопки и триггеры те же, что ушли последними, - повтор не чаще раза
+            // в kHoldResendUs. Такт при этом считается отработанным (waitCommand() просыпается, сетка не сбивается).
+            if (sendNow && stickCmd && !releaseNow && !padChanged && unpackActive(sent) && unpackX(sent) == outX && unpackY(sent) == outY && lastSendT &&
+                detail::Qpc::toUs(now - lastSendT) < kHoldResendUs) {
+                sendNow = false;
+                lastCmdTick = tickNo;
+                heldSkips_.fetch_add(1, std::memory_order_relaxed);
+                cmdSlots_.fetch_add(1, std::memory_order_release);
+                SetEvent(cmdEvent_);
+            }
+            if (sendNow && !suspended) {
                 const PadState st = encodeState(bl, bh, lt, rt, outX, outY);
                 if (releaseNow) releaseSeen = releaseSeq_.load(std::memory_order_acquire);
                 if (sendFrame(kOpCtlState, st.data(), st.size())) {
                     lastSendTick = tickNo;
+                    lastSendT = now;
                     lastState_ = st;
                     if (padChanged || (!stickCmd && !releaseNow)) padCommands_.fetch_add(1, std::memory_order_relaxed);
                     sentBl = bl;
@@ -1434,6 +1616,7 @@ private:
                         sent_.store(pack(true, outX, outY), std::memory_order_release);
                         injecting_ = true;
                         stickCommands_.fetch_add(1, std::memory_order_release);
+                        cmdSlots_.fetch_add(1, std::memory_order_release);
                         SetEvent(cmdEvent_);
                     } else if (releaseNow) {
                         releases_.fetch_add(1, std::memory_order_relaxed);
@@ -1459,13 +1642,13 @@ private:
                     answered_.store(asked);
                 }
             }
-            if (tickNo % static_cast<uint64_t>(std::max(1.0, std::round(physicalPollUs() / kTickUs))) == 0) {
+            if (tickNo % static_cast<uint64_t>(std::max(1.0, std::round(effectivePollUs(now) / kTickUs))) == 0) {
                 if (sendFrame(kOpCtlPhysical)) polls_.fetch_add(1, std::memory_order_relaxed);
             }
 
             // 4. Сверка заданного состояния: GET 0x40 идёт следом за командой этого же такта.
             if (verify.pending && detail::Qpc::toUs(now - verify.sentT) > kReplyTimeoutUs) verify.pending = false;
-            if (!verify.pending && now >= verify.nextT) {
+            if (!verify.pending && now >= verify.nextT && !suspended) {
                 if (sendFrame(kOpCtlState)) {
                     verify.pending = true;
                     verify.expect = lastState_;
@@ -1517,6 +1700,16 @@ private:
         if (timer) CloseHandle(timer);
     }
 
+    // Живучесть (ревизия 4). Атомики читают другие потоки; остальное - только рабочий поток и connect().
+    std::atomic<bool> padAbsent_{false}, padStalled_{false}, suspended_{false}, storm_{false};
+    std::atomic<uint64_t> padDrops_{0}, padStalls_{0}, storms_{0}, heldSkips_{0};
+    std::atomic<uint64_t> cmdSlots_{0};  // такты команд (отправки + пропущенные повторы) - commandCount(); resetStats() не трогает
+    std::atomic<double> lastPadDownMs_{0.0};
+    int ffRun_ = 0;
+    int64_t lastNewT_ = 0, resumeT_ = 0, absentT_ = 0, calmUntilT_ = 0;
+    std::array<int64_t, 8> dropTimes_{};
+    size_t dropIdx_ = 0;
+
     HANDLE handle_ = INVALID_HANDLE_VALUE;
     HANDLE cmdEvent_ = nullptr;  // взводится после каждой команды цели (waitCommand)
     std::string port_, info_;
@@ -1558,6 +1751,7 @@ private:
     bool haveRestore_ = false;                // интерполяцию меняли: в close() вернуть restoreInterp_
     uint8_t restoreInterp_ = 0;               // (эти поля - только поток, владеющий портом)
     int restoreBuffer_ = -1;                  // буфер до первой записи; -1 - не трогать
+    bool restoreFailed_ = false;              // close() не смог вернуть сглаживание
     std::atomic<uint64_t> settingsWrites_{0};
 
     mutable std::mutex physMutex_;  // phys_, physT_, snapT_, settings_, info_

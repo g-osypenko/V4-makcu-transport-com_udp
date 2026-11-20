@@ -194,5 +194,6 @@ int main(int argc, char** argv) {
     if (steps) std::printf("    renderer.step(): в среднем %.0f нс\n", static_cast<double>(stepNs) / steps);
     std::printf("    %s\n", tx.statsLine().c_str());
     tx.close();
+    if (tx.smoothingRestoreFailed()) std::printf("[!] сглаживание платы НЕ возвращено (геймпада не было 4 с): на плате осталось заданное\n");
     return 0;
 }

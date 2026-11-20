@@ -10,24 +10,40 @@ param(
     [string]$Tag = "soak",
     [string]$Steps = "hold2-p100",
     [int]$Step = 180,
-    [string]$Port = "COM5"
+    [string]$Port = "COM5",
+    [int]$KeepGoing = 0,  # >0: pad_soak --keep-going N (отказ не останавливает лестницу, ждёт возврата до N с; код 2 - были отказы)
+    [string]$View = "--keepalive"  # режим окна pad_probe_view: --keepalive (инжект) или --pollonly (только опрос)
 )
 Set-Location $PSScriptRoot
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $log = "data\soak_$Tag.log"
+$logFull = Join-Path $PSScriptRoot $log
+# Запись в журнал не должна падать, если файл кто-то читает (2026-11-20: tail -f из Git Bash блокировал Add-Content,
+# журнал pad_soak пропал): FileShare.ReadWrite, три попытки.
+function Write-LogLine([string]$line) {
+    for ($i = 0; $i -lt 3; $i++) {
+        try {
+            $fs = [System.IO.File]::Open($logFull, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $b = [System.Text.Encoding]::UTF8.GetBytes($line + "`r`n")
+            $fs.Write($b, 0, $b.Length); $fs.Close(); return
+        } catch { Start-Sleep -Milliseconds 20 }
+    }
+}
 function Say([string]$s) {
     $line = "{0} {1}" -f (Get-Date -Format "HH:mm:ss.fff"), $s
     Write-Output $line
-    Add-Content -Path $log -Value $line -Encoding utf8
+    Write-LogLine $line
 }
 function Snapshot([string]$name) {
     $out = "data\soak_${Tag}_info_$name.txt"
-    $p = Start-Process -FilePath ".\pad_probe_info.exe" -ArgumentList "--port $Port --poll 1" -NoNewWindow -PassThru `
+    # --poll 0 (2026-11-20): --poll 1 гнал 0x54 замкнутым циклом ~3500/с целую секунду - сразу после отказа это мешало
+    # плате подняться и могло испортить вывод «сам не вернулся». Без цикла снимок даёт один sequence: сравнивать t0/t10/t30.
+    $p = Start-Process -FilePath ".\pad_probe_info.exe" -ArgumentList "--port $Port --poll 0" -NoNewWindow -PassThru `
         -RedirectStandardOutput $out -RedirectStandardError "$out.err"
     if (-not $p.WaitForExit(25000)) { Say "  снимок ${name}: pad_probe_info не закончил за 25 с, процесс снят"; try { $p.Kill() } catch {} }
     Say ("  снимок {0}: COM-порты {1}" -f $name, ([System.IO.Ports.SerialPort]::GetPortNames() -join ","))
     Get-Content $out -Encoding utf8 -ErrorAction SilentlyContinue |
-        Select-String -Pattern 'kinds|km\.device|0x54 CONTROLLER|запросов|sequence менялся|timing|не открылся' |
+        Select-String -Pattern 'kinds|km\.device|0x54 CONTROLLER|запросов|sequence менялся|usb_timestamp|не открылся' |
         Select-Object -First 10 | ForEach-Object { Say ("    | " + $_.Line.Trim()) }
     Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
         Where-Object { $_.InstanceId -match '^USB\\VID_3537' -and $_.InstanceId -notmatch '&(MI|IG)_' } |
@@ -37,13 +53,14 @@ function Snapshot([string]$name) {
 $n = ($Steps -split ',').Count
 $viewDur = $n * $Step + 30
 Say "=== старт ${Tag}: ступени $Steps по $Step с, окно $viewDur с"
-$null = Start-Process -FilePath ".\pad_probe_view.exe" -ArgumentList "--rate 0 --keepalive --dur $viewDur --log data\view_soak_$Tag.log" -PassThru
+$null = Start-Process -FilePath ".\pad_probe_view.exe" -ArgumentList "--rate 0 $View --dur $viewDur --log data\view_soak_$Tag.log" -PassThru
 Start-Sleep -Seconds 2
 Push-Location ..\perfect-transport-gamepad-com
-& .\pad_soak.exe --port $Port --step $Step --steps $Steps 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -Variable soakOut | Out-Null
+$soakArgs = @("--port", $Port, "--step", $Step, "--steps", $Steps)
+if ($KeepGoing -gt 0) { $soakArgs += @("--keep-going", $KeepGoing) }
+& .\pad_soak.exe @soakArgs 2>&1 | ForEach-Object { $line = $_.ToString(); Write-LogLine $line; Write-Host $line }
 $code = $LASTEXITCODE
 Pop-Location
-$soakOut | Add-Content -Path $log -Encoding utf8
 Say "pad_soak: код выхода $code"
 if ($code -eq 3) {
     Snapshot "t0"
