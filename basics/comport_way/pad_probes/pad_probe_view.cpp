@@ -18,6 +18,8 @@
 //   --watch (рядом pad_drop_watch.ps1): зелёная "Крути ПРАВЫЙ стик кругами без перерыва. Донгл и провода НЕ трогай. На месте M:SS, обрывов: N";
 //            после отказа 40 с красная "ГЕЙМПАД ПРОПАЛ|МОЛЧИТ в ЧЧ:ММ:СС. НИЧЕГО НЕ ТРОГАЙ ещё N с: опрашиваю плату",
 //            затем "ГЕЙМПАД ПРОПАЛ|МОЛЧИТ в ЧЧ:ММ:СС. Плата опрошена. Ничего не перевтыкай, жди сообщения в чате"
+//   --freeze (рядом pad_soak --keep-going): до зависания как --keepalive, после - шаги просьбы MAKCU 2026-11-20 (отчёт
+//            Toolkit, второй через 30 с, перевтыкание донгла, перезапуск геймпада); тексты - у разбора ключа --freeze
 //   чёрная   "ГОТОВО. Окно закроется само"
 // Под надписью: "осталось N с". Нижние строки: состояние платы и Windows, пакетов/с, время последнего события.
 // Esc или крестик - выход раньше срока.
@@ -102,16 +104,19 @@ int readSoakStatus() {
     const std::string path = std::string(dir) + "makcu_pad_status.txt";
     WIN32_FILE_ATTRIBUTE_DATA a{};
     if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a)) return 0;
-    FILETIME nowFt;
-    GetSystemTimeAsFileTime(&nowFt);
-    const auto toU = [](const FILETIME& f) { return (static_cast<unsigned long long>(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
-    if (toU(nowFt) - toU(a.ftLastWriteTime) > 30000000ull) return 0;  // старше 3 с
     FILE* f = std::fopen(path.c_str(), "r");
     if (!f) return 0;
     char b[16] = {};
     const size_t n = std::fread(b, 1, sizeof(b) - 1, f);
     std::fclose(f);
+    // RELEASED (pad_soak --release-on-stall отключился от платы и вышел) - последнее слово, возраст не важен
+    if (n >= 8 && std::strncmp(b, "RELEASED", 8) == 0) return 4;
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    const auto toU = [](const FILETIME& f) { return (static_cast<unsigned long long>(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+    if (toU(nowFt) - toU(a.ftLastWriteTime) > 30000000ull) return 0;  // старше 3 с
     if (n >= 5 && std::strncmp(b, "STALL", 5) == 0) return 2;
+    if (n >= 6 && std::strncmp(b, "ABSENT", 6) == 0) return 3;  // 2026-11-20: для --freeze (донгл вынут)
     return 1;
 }
 
@@ -135,6 +140,17 @@ int main(int argc, char** argv) {
     // --pollonly (2026-11-20): рядом pad_soak только опрашивает 0x54, инжекта нет - "Инжекта нет. Правый стик не трогай,
     // раз в 10 с качни ЛЕВЫЙ стик". Отказы показываются как при --notouch ("жди сообщения в чате").
     bool pollOnly = false;
+    // --freeze (2026-11-20, просьба MAKCU после 7 зависаний GameSir из 7): то же, что --keepalive, но при зависании
+    // окно ведёт по шагам MAKCU. Рядом pad_soak --release-on-stall 8: STALL 8 с подряд -> он отключается от платы (пишет
+    // RELEASED и выходит), иначе Toolkit не снимет устройство в отчёт («lease busy»). Отсчёт от RELEASED:
+    //   STALL до 8 с "ГЕЙМПАД ЗАВИС в ЧЧ:ММ:СС? Ничего не трогай, отчёт пока НЕ делай: жду 8 с, не вернётся ли сам"
+    //   0-45 с  "ГЕЙМПАД ЗАВИС в ЧЧ:ММ:СС, программа отключилась от платы. Геймпад и плату НЕ трогай. Toolkit: Create report. Второй через N с"
+    //   45-90 с "Toolkit: создай ВТОРОЙ отчёт СЕЙЧАС. Геймпад и плату НЕ трогай. Дальше через N с"
+    //   90+ с   "Геймпад НЕ выключай. Выдерни донгл GameSir из USB3 платы и вставь обратно"
+    //   XInput снова > 200 пакетов/с: "ГЕЙМПАД ОЖИЛ в ЧЧ:ММ:СС после перевтыкания донгла|перезапуска геймпада. Больше ничего не трогай, жди сообщения в чате"
+    //   30 с после того, как геймпад пропал из Windows, а не ожил: "Геймпад НЕ ожил от перевтыкания донгла. Теперь выключи и включи геймпад"
+    // Каждый шаг - два сигнала.
+    bool freeze = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const bool more = i + 1 < argc;
@@ -147,12 +163,13 @@ int main(int argc, char** argv) {
         else if (a == "--press") press = true;
         else if (a == "--watch") watch = true;
         else if (a == "--pollonly") noTouch = pollOnly = true;
+        else if (a == "--freeze") noTouch = keepAlive = freeze = true;
         else if (a == "--offon" && i + 2 < argc) {
             offAt = std::atof(argv[++i]);
             onAt = std::atof(argv[++i]);
             noTouch = true;
         } else {
-            std::printf("pad_probe_view.exe [--port COM5] [--rate 0|N] [--dur 600] [--log FILE] [--notouch | --keepalive | --press | --watch | --offon OFF ON]\n");
+            std::printf("pad_probe_view.exe [--port COM5] [--rate 0|N] [--dur 600] [--log FILE] [--notouch | --keepalive | --freeze | --press | --watch | --offon OFF ON]\n");
             return 2;
         }
     }
@@ -202,6 +219,9 @@ int main(int argc, char** argv) {
     int64_t silT = t0;
     bool silent = false;
     int silences = 0;
+    // --freeze: время первого зависания, когда донгл вынули (ABSENT после фазы перевтыкания), ожил ли
+    int64_t freezeT = 0, unplugT = 0, aliveT = 0, stallStartT = 0;
+    std::wstring freezeAt, aliveAt;
     while (!g_stop && now() < endT) {
         pumpMessages();
         const int64_t t = now();
@@ -275,15 +295,71 @@ int main(int argc, char** argv) {
             const int soakState = readSoakStatus();
             if (soakState != g_lastSoakState) {
                 if (soakState == 2) out("[!] %s (%.1f с) pad_soak: геймпад ЗАВИС (плата отдаёт снимки, отчётов геймпада нет)\n", clockStr().c_str(), sec);
-                else if (g_lastSoakState == 2) out("[+] %s (%.1f с) pad_soak: зависание прошло\n", clockStr().c_str(), sec);
+                else if (soakState == 3) out("[!] %s (%.1f с) pad_soak: плата геймпада НЕ видит (ABSENT)\n", clockStr().c_str(), sec);
+                else if (soakState == 1 && g_lastSoakState >= 2) out("[+] %s (%.1f с) pad_soak: геймпад снова шлёт отчёты\n", clockStr().c_str(), sec);
                 if (soakState == 2) {
                     stallAt = wclock();
                     lastEvent = L"ЗАВИС в " + stallAt;
                 }
+                if (soakState == 2) stallStartT = t;
+                if (soakState == 4 && stallStartT) out("[!] %s (%.1f с) pad_soak: отключился от платы (RELEASED), Toolkit может снимать отчёт\n", clockStr().c_str(), sec);
                 g_lastSoakState = soakState;
             }
-            if (soakState == 2 && offAt < 0.0) {
-                swprintf(hint[which], 160, L"ГЕЙМПАД ЗАВИС в %ls: плата видит его, но отчётов нет. Ничего не трогай: жди сообщения в чате", stallAt.c_str());
+            // Шаги MAKCU начинаются, когда pad_soak (--release-on-stall) после долгого STALL отключился от платы: пока он
+            // держит COM7, Toolkit пишет «lease busy» и снимка устройства в отчёте нет (R-Q44ZFW, 2026-11-20 19:09).
+            // RELEASED без STALL в этом запуске окна - остаток прошлого прогона, не считается.
+            if (freeze && !freezeT && soakState == 4 && stallStartT) {
+                freezeT = t;
+                freezeAt = stallAt;
+                out("[!] %s (%.1f с) --freeze: шаг 1 - отчёт Toolkit\n", clockStr().c_str(), sec);
+            }
+            // После отключения pad_soak инжекта нет, и Windows видит клон платы как есть: завис - пакетов XInput нет,
+            // донгл вынут - геймпада в XInput нет, ожил - снова ~1000 пакетов/с.
+            if (freeze && freezeT) {
+                if (xiOk != 1 && !unplugT) {
+                    unplugT = t;
+                    out("[i] %s (%.1f с) --freeze: геймпада в Windows нет (донгл вынут?)\n", clockStr().c_str(), sec);
+                }
+                if (!aliveT && xiOk == 1 && pkRate > 200.0 && toMs(t - freezeT) >= 3000.0) {
+                    aliveT = t;
+                    aliveAt = wclock();
+                    out("[+] %s (%.1f с) --freeze: геймпад ОЖИЛ через %.1f с после отключения программы%s\n", clockStr().c_str(), sec, toMs(t - freezeT) / 1000.0,
+                        !unplugT ? " (донгл не трогали)" : toMs(t - unplugT) >= 30000.0 ? " (через 30+ с после выемки донгла - перезапуск геймпада)" : " (после перевтыкания донгла)");
+                }
+            }
+            if (freeze && freezeT) {
+                const int fs = static_cast<int>(toMs(t - freezeT) / 1000.0);
+                // два сигнала на каждом шаге, где нужно действие владельца (правило 10 CLAUDE.md)
+                static int beeped = -1;
+                const int stage = aliveT ? 4 : fs < 45 ? 0 : fs < 90 ? 1 : (unplugT && toMs(t - unplugT) >= 30000.0) ? 3 : 2;
+                if (stage != beeped) {
+                    beeped = stage;
+                    if (stage != 4) {
+                        Beep(1000, 180);
+                        Sleep(120);
+                        Beep(1000, 180);
+                    }
+                }
+                if (aliveT) {
+                    // ожил позже 30 с после выемки донгла - это уже перезапуск геймпада, а не перевтыкание
+                    const bool byPower = unplugT && toMs(aliveT - unplugT) >= 30000.0;
+                    swprintf(hint[which], 160, L"ГЕЙМПАД ОЖИЛ в %ls%ls. Больше ничего не трогай, жди сообщения в чате", aliveAt.c_str(),
+                             byPower ? L" после перезапуска геймпада" : unplugT ? L" после перевтыкания донгла" : L"");
+                    color = RGB(0, 130, 0);
+                } else if (fs < 45) {
+                    swprintf(hint[which], 160, L"ГЕЙМПАД ЗАВИС в %ls, программа отключилась от платы. Геймпад и плату НЕ трогай. Toolkit: Create report. Второй через %d с",
+                             freezeAt.c_str(), 45 - fs);
+                } else if (fs < 90) {
+                    swprintf(hint[which], 160, L"Toolkit: создай ВТОРОЙ отчёт СЕЙЧАС. Геймпад и плату НЕ трогай. Дальше через %d с", 90 - fs);
+                } else if (unplugT && toMs(t - unplugT) >= 30000.0) {
+                    swprintf(hint[which], 160, L"Геймпад НЕ ожил от перевтыкания донгла. Теперь выключи и включи геймпад");
+                } else {
+                    swprintf(hint[which], 160, L"Геймпад НЕ выключай. Выдерни донгл GameSir из USB3 платы и вставь обратно");
+                    color = RGB(200, 90, 0);
+                }
+            } else if (soakState == 2 && offAt < 0.0) {
+                if (freeze) swprintf(hint[which], 160, L"ГЕЙМПАД ЗАВИС в %ls? Ничего не трогай, отчёт пока НЕ делай: жду 8 с, не вернётся ли сам", stallAt.c_str());
+                else swprintf(hint[which], 160, L"ГЕЙМПАД ЗАВИС в %ls: плата видит его, но отчётов нет. Ничего не трогай: жди сообщения в чате", stallAt.c_str());
             } else if (offAt >= 0.0) {
                 color = RGB(200, 90, 0);
                 if (sec < offAt) swprintf(hint[which], 160, L"НЕ трогай геймпад. Через %d с ВЫКЛЮЧИ геймпад", static_cast<int>(offAt - sec) + 1);

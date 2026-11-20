@@ -49,10 +49,10 @@
 //   --sens N       [--duty %,%..] [--seg MS] чувствительность через эталон: tx.setSensitivity(%) на
 //                  отрезок (по умолчанию 100,75,50,33,25,10 и 1000 мс), между отрезками 100 %. N кругов.
 //                  Фактическая доля - по сообщениям Raw Input с движением. Водите мышью кругами.
-//   --stress S     [--load inject,sens,track,busy | idle] [--burst ON,OFF] [--withsens %] [--hand] [--slog FILE]
+//   --stress S     [--load inject,sens,track,busy,poll,getpos | idle] [--burst ON,OFF] [--withsens %] [--hand] [--slog FILE]
 //                  прогон на стабильность платы: S секунд нагрузка выбранного состава (инжект кругами 1 кГц,
 //                  чувствительность --withsens или 50 %, слежение, клик раз в 2 с + блокировка X+Y на 0.5 с
-//                  раз в 10 с). --burst: инжект порциями ON мс через OFF мс. Строка раз в секунду в журнал
+//                  раз в 10 с, poll - опрос кнопок 0x55 1000/с, getpos - опрос позиции 0x63 1000/с рядом с инжектом, только COM; по UDP не включать: темп). --burst: инжект порциями ON мс через OFF мс. Строка раз в секунду в журнал
 //                  (fflush, последняя переживёт зависание), раз в 10 с в консоль. Обрыв связи: нагрузка
 //                  снимается, 30 с ожидания самовосстановления, выход с кодом 3. --hand: надпись "водите".
 //
@@ -100,6 +100,16 @@ template <class Tx, class = void>
 struct HasSens : std::false_type {};
 template <class Tx>
 struct HasSens<Tx, std::void_t<decltype(std::declval<Tx&>().setSensitivity(0))>> : std::true_type {};
+// Есть ли у эталона pollButtons() (в UDP-эталоне нет: там опрос 0x55 только внутренний).
+template <class Tx, class = void>
+struct HasPollButtons : std::false_type {};
+template <class Tx>
+struct HasPollButtons<Tx, std::void_t<decltype(std::declval<Tx&>().pollButtons())>> : std::true_type {};
+// Есть ли у эталона pollPosition() (опрос 0x63 вызывающим; пока только COM).
+template <class Tx, class = void>
+struct HasPollPosition : std::false_type {};
+template <class Tx>
+struct HasPollPosition<Tx, std::void_t<decltype(std::declval<Tx&>().pollPosition())>> : std::true_type {};
 int g_withSens = 100;  // --withsens %: в --inject держать tx.setSensitivity(%) весь прогон
 
 template <class Tx>
@@ -1898,6 +1908,20 @@ inline bool stressHas(const char* k) {
 template <class T>
 int runStress(double seconds) {
     const bool inj = stressHas("inject"), sens = stressHas("sens"), track = stressHas("track"), busy = stressHas("busy");
+    const bool poll = stressHas("poll");      // опрос кнопок 0x55 каждый тик (1000/с) рядом с инжектом
+    const bool getpos = stressHas("getpos");  // опрос позиции 0x63 каждый тик (1000/с) рядом с инжектом - как km.getpos у владельца
+    using TxT = typename T::Tx;
+    // Опрос вызывающим: запросов и ответов 0x55 + 0x63 (у эталона без метода - 0).
+    auto pollAsk = [](const auto& s) -> uint64_t {
+        uint64_t n = s.buttonPolls;
+        if constexpr (HasPollPosition<TxT>::value) n += s.posAsk;
+        return n;
+    };
+    auto pollRep = [](const auto& s) -> uint64_t {
+        uint64_t n = s.buttonReplies;
+        if constexpr (HasPollPosition<TxT>::value) n += s.posAnyReplies;
+        return n;
+    };
     typename T::Tx tx;
     std::string err;
     if (!T::open(tx, err)) {
@@ -1935,8 +1959,9 @@ int runStress(double seconds) {
     const int sensPct = g_withSens < 100 ? g_withSens : 50;
     out(true, "[+] эталон: %s\n", tx.info().c_str());
     out(true, "[+] --stress %.0f с, старт %s, нагрузка: %s%s%s%s%s, порции %s, рука: %s, журнал %s\n", seconds, clock().c_str(),
-        inj ? "инжект 1 кГц " : "", sens ? "чувствительность " : "", track ? "слежение " : "", busy ? "клики+блокировки " : "",
-        (inj || sens || track || busy) ? "" : "простой", g_burst.size() >= 2 ? (std::to_string(g_burst[0]) + "/" + std::to_string(g_burst[1]) + " мс").c_str() : "нет",
+        inj ? "инжект 1 кГц " : "", sens ? "чувствительность " : "", track ? "слежение " : "",
+        (std::string(busy ? "клики+блокировки " : "") + (poll ? "опрос-0x55-1кГц " : "") + (getpos ? "опрос-позиции-0x63-1кГц " : "")).c_str(),
+        (inj || sens || track || busy || poll || getpos) ? "" : "простой", g_burst.size() >= 2 ? (std::to_string(g_burst[0]) + "/" + std::to_string(g_burst[1]) + " мс").c_str() : "нет",
         g_hand ? "водит" : "не трогать", g_stressLog.c_str());
     if (sens) {
         applySens(tx, sensPct);
@@ -1947,7 +1972,9 @@ int runStress(double seconds) {
     static const wchar_t* const kHintIdle = L"прогон на стабильность; Esc - досрочно";
     say(g_hand ? L"ВОДИТЕ МЫШЬЮ КРУГАМИ, НЕ ОСТАНАВЛИВАЯСЬ" : L"НЕ ТРОГАЙТЕ МЫШЬ", inj ? kHintInj : kHintIdle);
     sleepMs(1500.0);
-    out(true, "время    |    с | move/с | Raw/с | max пауза Raw, мс | записей | склеено | 0x63 отв./с | маска/с | связь | обрывов | окно в фокусе\n");
+    if (getpos && !HasPollPosition<TxT>::value) out(true, "[-] getpos: в этом эталоне pollPosition() нет - опроса не будет\n");
+    if (getpos && track) out(true, "[!] getpos вместе с track: ответы опроса смешаются со слежением\n");
+    out(true, "время    |    с | move/с | Raw/с | max пауза Raw, мс | записей | склеено | 0x63 отв./с | маска/с | опрос запр./отв. в с | связь | обрывов | окно в фокусе\n");
     const auto s0 = tx.stats();
     const uint64_t raw0 = g_rawTotal.load();
     const int64_t sx0 = g_rawSumX.load(), sy0 = g_rawSumY.load();
@@ -1955,6 +1982,7 @@ int runStress(double seconds) {
     int64_t due = t0, nextRep = t0 + sec, lostAt = 0;
     int64_t sentX = 0, sentY = 0, pendX = 0, pendY = 0;
     uint64_t moves = 0, movesPrev = 0, rawPrev = raw0, posPrev = s0.posReplies, togPrev = s0.sensToggles;
+    uint64_t bpPrev = pollAsk(s0), brPrev = pollRep(s0);
     double phase = 0.0, fx = 0.0, fy = 0.0;
     int silentS = 0, rep = 0;
     bool rawSilentNoted = false, back = false;
@@ -1970,6 +1998,12 @@ int runStress(double seconds) {
             if (tick % 2000 == 1040) tx.release(makcu::MouseButton::Left);
             if (tick % 10000 == 5000) tx.setLocks({LockTarget::X, LockTarget::Y}, true);
             if (tick % 10000 == 5500) tx.unlockAll();
+        }
+        if constexpr (HasPollButtons<typename T::Tx>::value) {
+            if (poll && !lostAt) tx.pollButtons();
+        }
+        if constexpr (HasPollPosition<TxT>::value) {
+            if (getpos && !lostAt) tx.pollPosition();
         }
         bool on = inj && !lostAt;
         if (on && g_burst.size() >= 2 && g_burst[0] + g_burst[1] > 0) {
@@ -2000,10 +2034,11 @@ int runStress(double seconds) {
         const double gapMs = Q::toUs(g_rawMaxGap.exchange(0)) / 1000.0;
         const double el = Q::toUs(now - t0) / 1e6;
         const uint64_t mv = moves - movesPrev, rw = raw - rawPrev;
-        out(rep % 10 == 0 || lostAt, "%s | %4.0f | %6llu | %5llu | %17.1f | %7llu | %7llu | %11llu | %7llu | %5s | %7llu | %s\n", clock().c_str(), el,
+        out(rep % 10 == 0 || lostAt, "%s | %4.0f | %6llu | %5llu | %17.1f | %7llu | %7llu | %11llu | %7llu | %9llu/%-9llu | %5s | %7llu | %s\n", clock().c_str(), el,
             static_cast<unsigned long long>(mv), static_cast<unsigned long long>(rw), gapMs,
             static_cast<unsigned long long>(T::records(st) - T::records(s0)), static_cast<unsigned long long>(T::merged(st) - T::merged(s0)),
             static_cast<unsigned long long>(st.posReplies - posPrev), static_cast<unsigned long long>(st.sensToggles - togPrev),
+            static_cast<unsigned long long>(pollAsk(st) - bpPrev), static_cast<unsigned long long>(pollRep(st) - brPrev),
             st.connected ? "да" : "НЕТ", static_cast<unsigned long long>(st.linkLost - s0.linkLost),
             foreground() ? "да" : "НЕТ (Raw Input прорежен)");
         // Инжект шёл всю секунду, а Raw Input молчит: мышь в ПК умерла раньше, чем транспорт заметил.
@@ -2018,6 +2053,8 @@ int runStress(double seconds) {
         rawPrev = raw;
         posPrev = st.posReplies;
         togPrev = st.sensToggles;
+        bpPrev = pollAsk(st);
+        brPrev = pollRep(st);
         if (!lostAt && st.linkLost != s0.linkLost) {
             lostAt = now;
             out(true, "[!] ОБРЫВ СВЯЗИ %s, на %.1f с прогона (нагрузка снята, жду до 30 с, вернётся ли плата сама)\n", clock().c_str(), el);

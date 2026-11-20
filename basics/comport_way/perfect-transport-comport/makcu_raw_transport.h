@@ -285,6 +285,9 @@ public:
         uint64_t posLost = 0;         // без ответа kPosLostUs
         uint64_t recentres = 0;       // km.screen заново (позиция ушла далеко от центра)
         uint64_t clamped = 0;         // ответов с позицией на краю (движение за краем потеряно)
+        // Опрос позиции вызывающим (pollPosition)
+        uint64_t posAsk = 0;          // запросов pollPosition()
+        uint64_t posAnyReplies = 0;   // всех ответов 0x63 (и на опрос слежения)
     };
 
     RawTransport() {
@@ -397,6 +400,29 @@ public:
     bool pollButtons() {
         std::lock_guard<std::mutex> lock(sendMutex_);
         return pollButtonsLocked();
+    }
+
+    // ---- позиция платы по запросу вызывающего (любой поток, не блокирует) ---------------
+    // GET 0x63 в кольцо записи, ответ разбирает поток чтения: lastPos() - последний ответ
+    // (позиция платы, зажата в km.screen), stats().posAnyReplies - сколько ответов пришло.
+    // Работает и во время инжекта (это как km.getpos у владельца: 1000/с рядом с move()).
+    // С setTracking(true) не смешивать: ответ на этот запрос слежение может принять за свой.
+    // false - кольцо записи занято или связи нет. Добавлено 2026-11-20 для стенда (--load getpos).
+    bool pollPosition() {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        if (!linkUpLocked()) return false;
+        const uint8_t q[5] = {0xDE, 0xAD, 0x00, 0x00, kOpGetPos};
+        if (!sendFrame(q, sizeof(q))) return false;
+        posAsk_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    struct BoardPos {
+        int x = 0;
+        int y = 0;
+    };
+    [[nodiscard]] BoardPos lastPos() const {
+        const uint32_t v = lastPos_.load(std::memory_order_acquire);
+        return {static_cast<int>(v & 0xFFFF), static_cast<int>(v >> 16)};
     }
 
     // ---- физическая мышь: позиция платы GET 0x63 --------------------------------------
@@ -645,6 +671,8 @@ public:
         s.droppedRecords = droppedRecords_.load();
         s.tracking = trackOn_.load();
         s.posPolls = posPolls_.load();
+        s.posAsk = posAsk_.load();
+        s.posAnyReplies = posAnyReplies_.load();
         s.posLost = posLost_.load();
         s.recentres = recentres_.load();
         {
@@ -1643,6 +1671,8 @@ private:
                 buttonReplies_.fetch_add(1, std::memory_order_relaxed);
                 applyMask(p[0]);
             } else if (op == kOpGetPos && plen >= 4) {
+                lastPos_.store(static_cast<uint32_t>(p[0] | p[1] << 8 | p[2] << 16 | p[3] << 24), std::memory_order_release);
+                posAnyReplies_.fetch_add(1, std::memory_order_relaxed);
                 onPos(p);
             } else if (op == kOpScreen && plen >= 4) {
                 screenW_.store(static_cast<uint16_t>(p[0] | p[1] << 8), std::memory_order_release);
@@ -2143,7 +2173,9 @@ private:
     std::atomic<uint16_t> screenW_{0}, screenH_{0};  // последний ответ GET 0x64
     std::atomic<uint32_t> screenReplies_{0};
     std::atomic<uint64_t> posPolls_{0}, posLost_{0}, recentres_{0};
-    mutable std::mutex posMutex_;                    // всё ниже - под ним (пишет поток чтения)
+    std::atomic<uint64_t> posAsk_{0}, posAnyReplies_{0};  // pollPosition(): запросов; всех ответов 0x63
+    std::atomic<uint32_t> lastPos_{0};               // последний ответ 0x63: x в младших 16 битах, y в старших
+    mutable std::mutex posMutex_;                   // всё ниже - под ним (пишет поток чтения)
     int64_t physX_ = 0, physY_ = 0;
     uint64_t posSamples_ = 0, posReplies_ = 0, clamped_ = 0;
     int64_t posSampleT_ = 0;

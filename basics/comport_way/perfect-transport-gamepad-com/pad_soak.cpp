@@ -204,6 +204,10 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::string port = "COM5", only, from;
     double stepSec = 120.0, keepGoing = 0.0;
+    // --release-on-stall S (2026-11-20, просьба MAKCU снять отчёт Toolkit во время зависания): геймпад ЗАВИС (padStalled)
+    // S с подряд -> записать RELEASED в файл состояния и выйти (код 5) БЕЗ close(): плате не уходит ни одной команды,
+    // Windows закрывает порт сам. Иначе программа держит COM7 Toolkit и его отчёт без снимка устройства («lease busy»).
+    double releaseOnStall = 0.0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--port" && i + 1 < argc) port = argv[++i];
@@ -211,12 +215,13 @@ int main(int argc, char** argv) {
         else if (a == "--steps" && i + 1 < argc) only = argv[++i];
         else if (a == "--from" && i + 1 < argc) from = argv[++i];
         else if (a == "--keep-going" && i + 1 < argc) keepGoing = std::atof(argv[++i]);
+        else if (a == "--release-on-stall" && i + 1 < argc) releaseOnStall = std::atof(argv[++i]);
         else if (a == "--list") {
             for (const Step& s : kSteps) std::printf("%-11s %s\n", s.name, s.what);
             std::printf("p<N>[-c<M>] свободная ступень: опрос N/с (100..2000), круг стиком M команд/с (до 1000)\n");
             return 0;
         } else {
-            std::printf("pad_soak.exe [--port COM5] [--step S] [--steps a,b,c] [--from NAME] [--keep-going S] [--list]\n");
+            std::printf("pad_soak.exe [--port COM5] [--step S] [--steps a,b,c] [--from NAME] [--keep-going S] [--release-on-stall S] [--list]\n");
             return 1;
         }
     }
@@ -301,7 +306,7 @@ int main(int argc, char** argv) {
         const int64_t t0 = Q::now();
         uint64_t xiPrev = g_xiPackets.load();
         auto prev = tx.stats();
-        double nextReport = 10.0, lastAlive = 0.0, nextStatus = 0.0;
+        double nextReport = 10.0, lastAlive = 0.0, nextStatus = 0.0, stalledSince = -1.0;
         uint64_t aliveSamples = prev.newSamples;
         uint64_t c0 = tx.commandCount();
         int phase = -1, taps = 0, applyAsked = 0, applyFailed = 0;
@@ -440,6 +445,18 @@ int main(int argc, char** argv) {
             if (t >= nextStatus) {
                 nextStatus = t + 0.25;
                 writeSoakStatus(tx.padStalled() ? "STALL" : tx.padAbsent() ? "ABSENT" : "OK");
+            }
+            if (releaseOnStall > 0) {
+                if (!tx.padStalled()) stalledSince = -1.0;
+                else if (stalledSince < 0) stalledSince = t;
+                else if (t - stalledSince >= releaseOnStall) {
+                    writeSoakStatus("RELEASED");
+                    std::printf("[!] %s геймпад ЗАВИС %.0f с подряд (с %.1f с ступени, последний новый отчёт на %.1f с) - отключаюсь от платы без команд (--release-on-stall), код 5\n",
+                        nowText().c_str(), t - stalledSince, stalledSince, lastAlive);
+                    std::printf("    до зависания: %s\n", tx.statsLine().c_str());
+                    std::fflush(stdout);
+                    std::_Exit(5);
+                }
             }
             const bool silent = t - lastAlive > 1.5 || tx.controllerKind() == 0;
             if (silent && downSince < 0) {

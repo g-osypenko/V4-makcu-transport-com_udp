@@ -12,7 +12,8 @@ param(
     [int]$Step = 180,
     [string]$Port = "COM5",
     [int]$KeepGoing = 0,  # >0: pad_soak --keep-going N (отказ не останавливает лестницу, ждёт возврата до N с; код 2 - были отказы)
-    [string]$View = "--keepalive"  # режим окна pad_probe_view: --keepalive (инжект) или --pollonly (только опрос)
+    [string]$View = "--keepalive",  # режим окна pad_probe_view: --keepalive (инжект), --pollonly (только опрос), --freeze (шаги MAKCU)
+    [int]$ReleaseOnStall = 0  # >0: pad_soak --release-on-stall N (зависание N с -> отключиться от платы для отчёта Toolkit, код 5)
 )
 Set-Location $PSScriptRoot
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -51,13 +52,14 @@ function Snapshot([string]$name) {
 }
 
 $n = ($Steps -split ',').Count
-$viewDur = $n * $Step + 30
+$viewDur = $n * $Step + 30 + $KeepGoing  # 2026-11-20: при --keep-going ступень ждёт возврата ещё до KeepGoing с
 Say "=== старт ${Tag}: ступени $Steps по $Step с, окно $viewDur с"
 $null = Start-Process -FilePath ".\pad_probe_view.exe" -ArgumentList "--rate 0 $View --dur $viewDur --log data\view_soak_$Tag.log" -PassThru
 Start-Sleep -Seconds 2
 Push-Location ..\perfect-transport-gamepad-com
 $soakArgs = @("--port", $Port, "--step", $Step, "--steps", $Steps)
 if ($KeepGoing -gt 0) { $soakArgs += @("--keep-going", $KeepGoing) }
+if ($ReleaseOnStall -gt 0) { $soakArgs += @("--release-on-stall", $ReleaseOnStall) }
 & .\pad_soak.exe @soakArgs 2>&1 | ForEach-Object { $line = $_.ToString(); Write-LogLine $line; Write-Host $line }
 $code = $LASTEXITCODE
 Pop-Location
