@@ -1,0 +1,4 @@
+# build outputs: cargo target, the medius C ABI DLL copied from medius/target, stand binaries
+medius_info/target/
+*.dll
+*.exe

@@ -4,3 +4,6 @@
 [submodule "ABCurves"]
 	path = ABCurves
 	url = https://github.com/optima-manent/ABCurves.git
+[submodule "medius"]
+	path = medius
+	url = https://github.com/K4HVH/medius.git

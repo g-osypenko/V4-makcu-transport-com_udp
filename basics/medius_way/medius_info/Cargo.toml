@@ -1,0 +1,11 @@
+[package]
+name = "medius_info"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only dump of a Medius box: version, health, clone, options, stats. Sends no input."
+
+[dependencies]
+medius = { path = "../../../medius" }
+
+[profile.release]
+opt-level = 2
